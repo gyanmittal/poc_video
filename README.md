@@ -102,6 +102,11 @@ ffmpeg -version
 | cluster_faces.py            |    ✓      |    ✓      |    ✓      |     ✓      |    —     |  ✓    |        —         |    —     |       —       |
 | cluster_faces_v2.py         |    ✓      |    ✓      |    ✓      |     ✓      |    ✓     |  ✓    |        —         |    ✓     |       ✓       |
 | cluster_faces_v3.py         |    ✓      |    ✓      |    ✓      |     ✓      |    ✓     |  ✓    |        ✓         |    ✓     |       ✓       |
+| cluster_faces_v4.py         |    ✓      |    ✓      |    ✓      |     ✓      |    ✓     |  ✓    |        ✓         |    ✓     |       ✓       |
+| cluster_faces_v5.py         |    ✓      |    ✓      |    ✓      |     ✓      |    ✓     |  ✓    |        ✓         |    ✓     |       ✓       |
+| cluster_faces_v6.py         |    ✓      |    ✓      |    ✓      |     ✓      |    ✓     |  ✓    |        ✓         |    ✓     |       ✓       |
+| cluster_faces_v7.py         |    ✓      |    ✓      |    ✓      |     ✓      |    ✓     |  ✓    |        ✓         |    ✓     |       ✓       |
+| cluster_faces_v8.py         |    ✓      |    ✓      |    ✓      |     ✓      |    ✓     |  ✓    |        ✓         |    ✓     |       ✓       |
 | prepare_person_clips_sample.py |  —     |    —      |    —      |     —      |    —     |  —    |        —         |    —     |       —       |
 
 Notes:
