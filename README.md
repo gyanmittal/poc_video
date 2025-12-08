@@ -531,3 +531,131 @@ python3 poc_video/cluster_faces_v3.py   --corpus poc_video/sample_data/videos   
 ```
 python3 poc_video/cluster_faces_v2.py   --corpus poc_video/sample_data/videos   --output poc_video/face_clusters_out_v2   --detector mtcnn --embedder facenet   --cluster-scope per_video   --db-enable --db-path poc_video/face_cache.duckdb   --progress-only
 ```
+
+---
+
+# Face Clustering v4 (cluster_faces_v4.py) — Person-only with blurred background
+
+## Quickstart
+```
+python3 poc_video/cluster_faces_v4.py \
+  --corpus poc_video/sample_data/videos \
+  --output poc_video/face_clusters_out_v4 \
+  --detector mtcnn --embedder facenet \
+  --cluster-scope per_video \
+  --db-enable --db-path poc_video/face_cache.duckdb \
+  --progress-only --annotate-clips
+```
+
+## Notes
+- Person region remains sharp; background is blurred. If absent, frame is black.
+- DB path is versioned: if you pass `--db-path poc_video/face_cache.duckdb`, v4 writes to `poc_video/face_cache_v4.duckdb`.
+
+---
+
+# Face Clustering v5 (cluster_faces_v5.py) — Keep scene, grey out others, add audio
+
+## Quickstart
+```
+python3 poc_video/cluster_faces_v5.py \
+  --corpus poc_video/sample_data/videos \
+  --output poc_video/face_clusters_out_v5 \
+  --detector mtcnn --embedder facenet \
+  --cluster-scope per_video \
+  --db-enable --db-path poc_video/face_cache.duckdb \
+  --progress-only --annotate-clips \
+  --similarity-threshold 0.45 --min-cluster-size 4 \
+  --face-min-sharpness 90 --face-min-area-ratio 0.04 \
+  --tracker CSRT --detect-every-k 3 --sample-fps 3.0 \
+  --annotate-thickness 3 --annotate-color 0,255,0 \
+  --max-video-secs 2000
+```
+
+## Notes
+- Keeps full scene, greys out other persons, draws a green box on the target.
+- Muxes original audio into the clip.
+- DB path is versioned: v5 appends `_v5` (defaults to `poc_video/face_cache_v5.duckdb`).
+- To process all frames, omit `--sample-fps`.
+
+---
+
+# Face Clustering v6 (cluster_faces_v6.py) — v3 + audio
+
+## Quickstart
+```
+python3 poc_video/cluster_faces_v6.py \
+  --corpus poc_video/sample_data/videos \
+  --output poc_video/face_clusters_out_v6 \
+  --detector mtcnn --embedder facenet \
+  --cluster-scope per_video \
+  --db-enable --db-path poc_video/face_cache.duckdb \
+  --progress-only --annotate-clips
+```
+
+## Notes
+- Same annotations as v3, but audio is muxed into each clip.
+- Uses unversioned DB path by default (`poc_video/face_cache.duckdb`).
+
+---
+
+# Face Clustering v7 (cluster_faces_v7.py) — Vocals-only audio (music reduced)
+
+## Quickstart
+```
+python3 poc_video/cluster_faces_v7.py \
+  --corpus poc_video/sample_data/videos \
+  --output poc_video/face_clusters_out_v7 \
+  --detector mtcnn --embedder facenet \
+  --cluster-scope per_video \
+  --db-enable --db-path poc_video/face_cache.duckdb \
+  --progress-only --annotate-clips
+```
+
+## Notes
+- Applies FFmpeg voice-focused filters (band-pass 200–3800 Hz, light denoise, limiter) to attenuate music and keep speech.
+- No extra Python deps vs v6; requires FFmpeg installed.
+
+---
+
+# Face Clustering v8 (cluster_faces_v8.py) — Optional diarization for target-only voice
+
+## Quickstart (presence-gated vocals)
+```
+python3 poc_video/cluster_faces_v8.py \
+  --corpus poc_video/sample_data/videos \
+  --output poc_video/face_clusters_out_v8 \
+  --detector mtcnn --embedder facenet \
+  --cluster-scope per_video \
+  --db-enable --db-path poc_video/face_cache.duckdb \
+  --progress-only --annotate-clips
+```
+
+## With diarization (target-only voice)
+```
+# Pass token explicitly
+python3 poc_video/cluster_faces_v8.py --diarize --hf-token YOUR_HF_TOKEN \
+  --corpus poc_video/sample_data/videos --output poc_video/face_clusters_out_v8 \
+  --detector mtcnn --embedder facenet --cluster-scope per_video \
+  --db-enable --db-path poc_video/face_cache.duckdb --progress-only --annotate-clips
+
+# Or via env var
+export HF_TOKEN=YOUR_HF_TOKEN
+python3 poc_video/cluster_faces_v8.py --diarize \
+  --corpus poc_video/sample_data/videos --output poc_video/face_clusters_out_v8 \
+  --detector mtcnn --embedder facenet --cluster-scope per_video \
+  --db-enable --db-path poc_video/face_cache.duckdb --progress-only --annotate-clips
+```
+
+## Notes
+- If diarization is unavailable, v8 falls back to presence-gated vocals (band-pass + gating).
+- Optional deps for diarization: `pip3 install -r poc_video/requirements-v8-optional.txt` (includes pyannote.audio).
+
+---
+
+# Versioned DB filenames
+- v3/v6 use unversioned DB path by default: `poc_video/face_cache.duckdb`.
+- v4 appends `_v4` if missing; default `poc_video/face_cache_v4.duckdb`.
+- v5 appends `_v5` if missing; default `poc_video/face_cache_v5.duckdb`.
+
+# Processing all frames
+- To process every frame at native FPS, omit `--sample-fps`.

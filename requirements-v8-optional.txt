@@ -1,0 +1,7 @@
+# Optional dependencies for v8 diarization (speaker detection)
+# Install only if you run cluster_faces_v8.py with --diarize
+pyannote.audio
+huggingface_hub
+librosa
+soundfile
+omegaconf

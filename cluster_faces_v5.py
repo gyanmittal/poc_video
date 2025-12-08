@@ -62,6 +62,13 @@ def annotate_segment_opencv(
         cap.release()
         return False
 
+    # Green box style
+    try:
+        color = v3.parse_color_bgr(cfg.annotate_color)
+    except Exception:
+        color = (0, 255, 0)
+    thickness = max(1, int(getattr(cfg, 'annotate_thickness', 3)))
+
     tracker = None
     cur_idx = start_f
 
@@ -70,6 +77,9 @@ def annotate_segment_opencv(
     last_smooth_body: Optional[Tuple[int, int, int, int]] = None
     linger_frames = max(1, int(0.5 * fps))
     linger_left = 0
+    # Face detectors to find other persons to remove
+    other_haar = v3.load_haar_detector()
+    other_mtcnn = v3.load_mtcnn(cfg.device) if cfg.detector == 'mtcnn' else None
 
     def nearest_detection(frame_idx: int, max_window: int = int(1.5 * fps)) -> Optional[Tuple[int, Tuple[int, int, int, int]]]:
         if not det_frames:
@@ -87,6 +97,20 @@ def annotate_segment_opencv(
         if abs(best_f - frame_idx) <= max_window:
             return best_f, cluster_frame_boxes[best_f]
         return None
+
+    def _iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
+        ax, ay, aw, ah = a
+        bx, by, bw, bh = b
+        ax2, ay2 = ax + aw, ay + ah
+        bx2, by2 = bx + bw, by + bh
+        ix1, iy1 = max(ax, bx), max(ay, by)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+        inter = iw * ih
+        if inter <= 0:
+            return 0.0
+        union = aw * ah + bw * bh - inter
+        return inter / max(1e-6, union)
 
     init = nearest_detection(start_f)
     if init is not None:
@@ -146,7 +170,7 @@ def annotate_segment_opencv(
             bx, by, bw, bh = v3.expand_to_body_bbox(det_box, W, H, cfg)
             to_draw = (bx, by, bw, bh)
             present_now = True
-        elif bb_trk is not None:
+        elif False:
             nd = nearest_detection(cur_idx, max_window=int(1.5 * fps))
             if nd is not None:
                 _, bbN = nd
@@ -165,7 +189,7 @@ def annotate_segment_opencv(
                     to_draw = (bx2, by2, bw2, bh2)
                     present_now = True
 
-        if to_draw is None and last_bb_body is not None and linger_left > 0:
+        if False and to_draw is None and last_bb_body is not None and linger_left > 0:
             bx, by, bw, bh = last_bb_body
             to_draw = (bx, by, bw, bh)
             linger_left = max(0, linger_left - 1)
@@ -176,24 +200,50 @@ def annotate_segment_opencv(
             pad = int(round(max(w0, h0) * 0.20))
             x0, y0, w0, h0 = x0 - pad // 2, y0 - pad // 2, w0 + pad, h0 + pad
             to_draw = _clamp_bbox(x0, y0, w0, h0, W, H)
-            if last_smooth_body is not None:
-                to_draw = _smooth_bbox(last_smooth_body, to_draw, alpha=0.25)
             # Snap to even pixels to reduce subpixel jitter
             x1, y1, w1, h1 = to_draw
             to_draw = _clamp_bbox((x1 // 2) * 2, (y1 // 2) * 2, (w1 // 2) * 2, (h1 // 2) * 2, W, H)
 
         if to_draw is not None:
             x, y, w, h = to_draw
-            # Black background; paste only the person region (no grey/blur)
-            out = np.zeros_like(frame)
-            out[y:y + h, x:x + w] = frame[y:y + h, x:x + w]
+            # Keep full scene, but remove other persons (mask their body regions)
+            out = frame.copy()
+            try:
+                faces = v3.detect_faces(frame, cfg, other_haar, other_mtcnn)
+            except Exception:
+                faces = []
+            for fx, fy, fw, fh in faces:
+                bb_other = v3.expand_to_body_bbox((int(fx), int(fy), int(fw), int(fh)), W, H, cfg)
+                if _iou((x, y, w, h), bb_other) < 0.30:
+                    ox, oy, ow, oh = bb_other
+                    roi = out[oy:oy + oh, ox:ox + ow]
+                    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                    gray_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+                    out[oy:oy + oh, ox:ox + ow] = cv2.addWeighted(gray_bgr, 0.85, roi, 0.15, 0.0)
             last_bb_body = (x, y, w, h)
             last_smooth_body = (x, y, w, h)
             if present_now:
                 linger_left = linger_frames
         else:
-            out = np.zeros_like(frame)
+            # If target not confidently present, keep scene but remove all detected persons
+            out = frame.copy()
+            try:
+                faces = v3.detect_faces(frame, cfg, other_haar, other_mtcnn)
+            except Exception:
+                faces = []
+            for fx, fy, fw, fh in faces:
+                ox, oy, ow, oh = v3.expand_to_body_bbox((int(fx), int(fy), int(fw), int(fh)), W, H, cfg)
+                roi = out[oy:oy + oh, ox:ox + ow]
+                gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                gray_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+                out[oy:oy + oh, ox:ox + ow] = cv2.addWeighted(gray_bgr, 0.85, roi, 0.15, 0.0)
 
+        # Draw green box around target if present
+        if to_draw is not None:
+            try:
+                cv2.rectangle(out, (x, y), (x + w, y + h), color, thickness)
+            except Exception:
+                pass
         writer.write(out)
         cur_idx += 1
 
