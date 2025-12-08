@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+
+# Media
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.jpg
+*.jpeg
+*.png
+*.gif
+
+# Databases
+*.duckdb
+*.db
+*.sqlite
+
+# Generated outputs
+*_out*/
+face_clusters_out*/
