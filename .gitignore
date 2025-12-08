@@ -22,3 +22,4 @@ __pycache__/
 # Generated outputs
 *_out*/
 face_clusters_out*/
+*.duckdb.wal
