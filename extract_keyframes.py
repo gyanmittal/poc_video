@@ -75,18 +75,32 @@ class ProcessingConfig:
     model_input_size: int = 224  # model crop size
     quality_alpha: float = 1.0  # weight for laplacian variance (sharpness)
     quality_beta: float = 0.0   # optional additional contrast weight
+    quality_gamma: float = 0.0  # weight for aesthetic score (visual appeal)
+    use_aesthetic: bool = True  # enable aesthetic scoring for entertainment content
+    min_aesthetic: float = 25.0  # minimum aesthetic score to keep a frame
+    two_pass: bool = True  # if True, run two-pass: store all + select unique most-aesthetic
+    sec_per_image: float = 10.0  # cap images to duration_sec / sec_per_image
     device: Optional[str] = None  # 'cuda', 'mps', or 'cpu'
     pretrained: bool = True  # try to load pretrained weights
     save_jpeg_quality: int = 95  # JPEG save quality
     max_frames: Optional[int] = None  # cap processed frames for debugging
+    max_seconds: Optional[float] = None
+    # To process only the first 15 minutes, use: --max-seconds 900
     backbone: str = "resnet50"  # timm model name, e.g., 'resnet50', 'efficientnet_b0'
     dedup_threshold: float = 0.07  # cosine distance threshold to suppress near-duplicate selected frames
     face_filter: bool = False  # require at least one detected face per frame
+    indoor_require_face: bool = True  # if frame is likely indoor and no face present, drop it
+    outdoor_allow_scenery: bool = False  # if outdoor and scenery is good, allow no people/faces
+    require_scene_or_person: bool = True  # drop frames that contain neither scenery nor person
+    scenic_edge_min: float = 0.015  # minimum edge density to consider frame scenic (0-1)
+    scenic_sat_min: float = 0.12    # minimum average saturation (0-1)
+    scenic_brightness_min: float = 0.12  # minimum average brightness (0-1)
     min_sharpness: float = 50.0  # discard frames with Laplacian variance below this
     video_face_filter: bool = False  # skip entire video if no prominent faces appear
     min_face_area: float = 0.015  # minimum face area ratio (bbox area / frame area) to be considered prominent
     min_face_frames: int = 1  # require at least this many frames with a prominent face to process video
     debug: bool = False  # debug mode: throttle logs to 10s intervals and completion
+    progress_only: bool = False
     # Person prominence filter (OpenCV HOG-based)
     person_filter: bool = True  # require at least one prominent person per frame
     min_person_area: float = 0.08  # minimum person bbox area ratio to be considered prominent
@@ -98,6 +112,13 @@ class ProcessingConfig:
     # Subtitle tolerance (do not treat short bottom subtitles as prominent)
     subtitle_tolerant: bool = True
     subtitle_max_rel_height: float = 0.12  # relative to full image height
+
+def dprint(cfg: ProcessingConfig, msg: str) -> None:
+    if getattr(cfg, 'debug', False) and not getattr(cfg, 'progress_only', False):
+        try:
+            print(msg, flush=True)
+        except Exception:
+            pass
 
 
 # -------------------------------
@@ -150,6 +171,11 @@ class DuckDBStorage:
             );
             """
         )
+        # Add aesthetic column for two-pass selection if missing
+        try:
+            self.con.execute("ALTER TABLE frames ADD COLUMN IF NOT EXISTS aesthetic DOUBLE;")
+        except Exception:
+            pass
         self.con.execute(
             """
             CREATE TABLE IF NOT EXISTS embeddings (
@@ -189,16 +215,26 @@ class DuckDBStorage:
         return video_id
 
     def insert_frame(self, video_id: str, frame_index: int, timestamp_sec: float,
-                     quality: float, group_id: str, is_representative: bool = False,
-                     run_id: Optional[str] = None) -> str:
+                     quality: float, group_id: Optional[str], is_representative: bool = False,
+                     run_id: Optional[str] = None, aesthetic: Optional[float] = None) -> str:
         frame_id = f"{video_id}:{run_id}:{frame_index}" if run_id else f"{video_id}:{frame_index}"
-        self.con.execute(
-            """
-            INSERT INTO frames (frame_id, video_id, frame_index, timestamp_sec, quality, group_id, is_representative)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            [frame_id, video_id, int(frame_index), float(timestamp_sec), float(quality), group_id, is_representative],
-        )
+        try:
+            self.con.execute(
+                """
+                INSERT INTO frames (frame_id, video_id, frame_index, timestamp_sec, quality, group_id, is_representative, aesthetic)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [frame_id, video_id, int(frame_index), float(timestamp_sec), float(quality), group_id, is_representative, aesthetic],
+            )
+        except Exception:
+            # legacy DB without 'aesthetic'
+            self.con.execute(
+                """
+                INSERT INTO frames (frame_id, video_id, frame_index, timestamp_sec, quality, group_id, is_representative)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [frame_id, video_id, int(frame_index), float(timestamp_sec), float(quality), group_id, is_representative],
+            )
         return frame_id
 
     def insert_embedding(self, frame_id: str, emb: np.ndarray) -> None:
@@ -259,6 +295,44 @@ class DuckDBStorage:
             """
         )
         return self.con.execute(query, [video_id]).fetchall()
+
+    def fetch_frames_with_embeddings(self, video_id: str, run_id: Optional[str]) -> list:
+        if run_id:
+            like = f"{video_id}:{run_id}:%"
+            query = (
+                """
+                SELECT f.frame_index, f.timestamp_sec, COALESCE(f.aesthetic, 0.0) AS aesthetic,
+                       f.quality, f.frame_id, e.dim, e.embedding
+                FROM frames f
+                INNER JOIN embeddings e ON f.frame_id = e.frame_id
+                WHERE f.video_id = ? AND f.frame_id LIKE ?
+                ORDER BY aesthetic DESC, f.quality DESC
+                """
+            )
+            rows = self.con.execute(query, [video_id, like]).fetchall()
+        else:
+            query = (
+                """
+                SELECT f.frame_index, f.timestamp_sec, COALESCE(f.aesthetic, 0.0) AS aesthetic,
+                       f.quality, f.frame_id, e.dim, e.embedding
+                FROM frames f
+                INNER JOIN embeddings e ON f.frame_id = e.frame_id
+                WHERE f.video_id = ?
+                ORDER BY aesthetic DESC, f.quality DESC
+                """
+            )
+            rows = self.con.execute(query, [video_id]).fetchall()
+        out = []
+        for fi, ts, aest, q, fid, dim, blob in rows:
+            try:
+                v = np.frombuffer(blob, dtype=np.float32)
+                if v.shape[0] != int(dim):
+                    continue
+                n = float(np.linalg.norm(v)) + 1e-9
+                out.append((int(fi), float(ts), float(aest), float(q), str(fid), (v / n).astype(np.float32)))
+            except Exception:
+                continue
+        return out
 
     def close(self) -> None:
         try:
@@ -384,18 +458,106 @@ def compute_embedding(
 # Quality scoring
 # -------------------------------
 
-def compute_quality(frame_bgr: np.ndarray, alpha: float = 1.0, beta: float = 0.0) -> float:
-    """Compute a scalar quality score.
+def compute_aesthetic_score(frame_bgr: np.ndarray, has_face: bool = False, has_person: bool = False) -> float:
+    """Simple aesthetic scoring for entertainment content.
+    
+    Combines:
+    - Color vibrancy (saturation and contrast)
+    - Edge density (indicates interesting content)
+    - Face/person presence bonus
+    Returns a score roughly 0-100 (higher is better).
+    """
+    # Convert to different color spaces
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    
+    # Color vibrancy: average saturation
+    saturation = np.mean(hsv[:, :, 1]) / 255.0 * 50  # 0-50 scale
+    
+    # Contrast: standard deviation of lightness
+    contrast = np.std(hsv[:, :, 2]) / 255.0 * 30  # 0-30 scale
+    
+    # Edge density: richness of content
+    edges = cv2.Canny(gray, 50, 150)
+    edge_density = np.sum(edges > 0) / edges.size * 20  # 0-20 scale
+    
+    # Bonus for faces/persons (important for entertainment content)
+    face_bonus = 0.0
+    if has_face:
+        face_bonus += 10.0  # Faces are visually appealing
+    elif has_person:
+        face_bonus += 5.0   # People are good, but faces better
+    
+    return saturation + contrast + edge_density + face_bonus
+
+
+def compute_quality(frame_bgr: np.ndarray, alpha: float = 1.0, beta: float = 0.0, gamma: float = 0.0, aesthetic_score: float = 0.0) -> float:
+    """Compute a scalar quality score for entertainment appeal.
 
     - Sharpness via variance of Laplacian (higher is sharper).
     - Optional contrast term: std-dev of grayscale intensities.
-    quality = alpha * lap_var + beta * gray_std
+    - Optional aesthetic score (higher is more visually appealing).
+    quality = alpha * lap_var + beta * gray_std + gamma * aesthetic_score
     """
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     lap = cv2.Laplacian(gray, cv2.CV_64F)
     lap_var = float(lap.var())
     gray_std = float(gray.std())
-    return float(alpha * lap_var + beta * gray_std)
+    return float(alpha * lap_var + beta * gray_std + gamma * aesthetic_score)
+
+
+# -------------------------------
+# Simple outdoor vs indoor heuristic
+# -------------------------------
+
+def is_likely_outdoor(frame_bgr: np.ndarray) -> bool:
+    """Very fast heuristic: look for sky/vegetation cues.
+    - Sky: blue-ish hues in top band with sufficient saturation/value
+    - Vegetation: green-ish hues anywhere
+    """
+    try:
+        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+        H, W = hsv.shape[:2]
+        top_h = max(1, int(0.35 * H))
+        top = hsv[:top_h, :, :]
+        # OpenCV hue range: [0,180]; blue approx [90,140]
+        h = top[:, :, 0]
+        s = top[:, :, 1]
+        v = top[:, :, 2]
+        sky_mask = ((h >= 90) & (h <= 140) & (s >= 50) & (v >= 100)).astype(np.uint8)
+        sky_ratio = float(sky_mask.mean())
+        # Green anywhere: hue ~[35,85]
+        h_all = hsv[:, :, 0]
+        s_all = hsv[:, :, 1]
+        v_all = hsv[:, :, 2]
+        green_mask = ((h_all >= 35) & (h_all <= 85) & (s_all >= 50) & (v_all >= 60)).astype(np.uint8)
+        green_ratio = float(green_mask.mean())
+        return (sky_ratio > 0.06) or (green_ratio > 0.12)
+    except Exception:
+        return False
+
+
+def is_scenic(frame_bgr: np.ndarray, edge_min: float = 0.02, sat_min: float = 0.12, brightness_min: float = 0.12) -> bool:
+    """Heuristic: does the frame contain scenery (not blank/logo screens)?
+
+    Criteria (all must pass):
+    - Enough overall brightness (avoid near-black frames)
+    - Sufficient edge density (indicates rich content vs. flat screen)
+    - Some colorfulness (exclude monochrome logos/blank)
+    Additionally returns True if the outdoor heuristic fires.
+    """
+    try:
+        if is_likely_outdoor(frame_bgr):
+            return True
+        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        v_mean = float(hsv[:, :, 2].mean()) / 255.0
+        s_mean = float(hsv[:, :, 1].mean()) / 255.0
+        edges = cv2.Canny(gray, 50, 150)
+        edge_density = float((edges > 0).mean())
+        return (v_mean >= brightness_min) and (edge_density >= edge_min) and (s_mean >= sat_min)
+    except Exception:
+        return False
 
 
 # -------------------------------
@@ -761,7 +923,8 @@ def process_video(
     """
     os.makedirs(output_dir, exist_ok=True)
     video_name = os.path.splitext(os.path.basename(video_path))[0]
-    video_out_dir = os.path.join(output_dir, video_name)
+    program_name = os.path.splitext(os.path.basename(__file__))[0]
+    video_out_dir = os.path.join(output_dir, program_name, video_name)
     # Defer directory creation until after video-level filters pass
 
     # Read basic video metadata
@@ -774,6 +937,12 @@ def process_video(
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     duration_sec = (frame_count / fps) if (frame_count > 0 and fps > 0) else None
     cap.release()
+
+    # Progress denominator capped by max_seconds if provided
+    progress_total_frames = frame_count
+    if cfg.max_seconds is not None and float(cfg.max_seconds) > 0 and fps > 0:
+        limit_frames = int(round(float(cfg.max_seconds) * float(fps)))
+        progress_total_frames = min(frame_count, limit_frames)
 
     # Optional: video-level face prominence precheck BEFORE any DB writes or output creation
     if cfg.video_face_filter:
@@ -806,7 +975,7 @@ def process_video(
     # Images will be saved directly into video_out_dir (no 'selected' subfolder)
     skipped_dir = os.path.join(video_out_dir, "skipped")
     os.makedirs(skipped_dir, exist_ok=True)
-    if not cfg.debug:
+    if not cfg.debug and not getattr(cfg, 'progress_only', False):
         print(f"[info] Streaming video '{video_name}': fps={fps:.2f}, frames={frame_count}, duration={duration_sec if duration_sec else 0:.1f}s (per-second best enabled)", flush=True)
 
     # Init storage and video record
@@ -817,6 +986,7 @@ def process_video(
 
     # Load model for embeddings
     model, device, _, mean, std = load_model(device=cfg.device, pretrained=cfg.pretrained, backbone=cfg.backbone)
+    dprint(cfg, f"[init] {video_name} fps={fps:.2f} frames={frame_count} frame_skip={cfg.frame_skip} device={device} backbone={cfg.backbone} dedup_thr={cfg.dedup_threshold} max_seconds={cfg.max_seconds}")
 
     # State for threshold grouping
     anchor_embedding: Optional[np.ndarray] = None
@@ -826,9 +996,9 @@ def process_video(
     group: Optional[GroupState] = None
     selected_summaries: list = []
     selected_entries: list = []
-    # Face detector (Haar) if enabled (frame-level subject filter)
+    # Face detector (Haar) if enabled (frame-level subject filter or indoor-face requirement)
     face_cascade = None
-    if cfg.face_filter:
+    if cfg.face_filter or cfg.indoor_require_face:
         try:
             cascade_path = os.path.join(cv2.data.haarcascades, 'haarcascade_frontalface_default.xml')
             if os.path.exists(cascade_path):
@@ -949,7 +1119,7 @@ def process_video(
             return
 
         # Text filter at commit stage (best-per-second only)
-        if False and cfg.text_filter:
+        if cfg.text_filter:
             if is_text_prominent(
                 sec_best_img,
                 cfg.text_area_threshold,
@@ -1025,7 +1195,11 @@ def process_video(
                 last_debug_print_sec = cur_s
 
     # Iterate frames streaming; keep only the best-quality frame per second
+    start_ts = time.time()
+    next_log_frame = 1000
     for frame_index, timestamp_sec, frame_bgr in extract_frames(video_path, frame_skip=cfg.frame_skip, max_frames=cfg.max_frames):
+        if cfg.max_seconds is not None and timestamp_sec is not None and timestamp_sec >= float(cfg.max_seconds):
+            break
         # Determine current second bucket
         s_bucket = int(timestamp_sec) if timestamp_sec is not None else (int(frame_index / fps) if fps and fps > 0 else frame_index)
         if current_sec is None:
@@ -1041,7 +1215,13 @@ def process_video(
             current_sec = s_bucket
 
         # Optional filters: person, face, and blur before considering as candidate (text checked at commit stage)
-        if cfg.person_filter and hog is not None:
+        H, W = frame_bgr.shape[:2]
+        roi_rects: List[Tuple[int, int, int, int]] = []
+        # Outdoor + scenic heuristics (used by gating decisions)
+        outdoor = is_likely_outdoor(frame_bgr)
+        scenic = is_scenic(frame_bgr, edge_min=cfg.scenic_edge_min, sat_min=cfg.scenic_sat_min, brightness_min=cfg.scenic_brightness_min)
+        # Person gating: allow missing person only if frame is outdoor and flag is enabled
+        if cfg.person_filter and hog is not None and not (getattr(cfg, 'outdoor_allow_scenery', False) and outdoor):
             H, W = frame_bgr.shape[:2]
             gray_p = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
             rects, _ = hog.detectMultiScale(gray_p, winStride=(8, 8), padding=(8, 8), scale=1.05)
@@ -1054,29 +1234,94 @@ def process_video(
             if max_ratio < cfg.min_person_area:
                 save_skipped(frame_bgr, frame_index, float(timestamp_sec), "person_small")
                 continue
-        if cfg.face_filter and face_cascade is not None:
+            # Candidate ROIs for subject sharpness check (persons)
+            try:
+                roi_rects = [(int(x), int(y), int(w), int(h)) for (x, y, w, h) in rects]
+            except Exception:
+                roi_rects = []
+        # Face gating: enforce face when indoor if configured (or if face_filter is explicitly enabled)
+        must_have_face = False
+        if cfg.face_filter or (cfg.indoor_require_face and not outdoor):
+            must_have_face = True
+        if (cfg.face_filter or cfg.indoor_require_face) and face_cascade is not None:
             gray_face = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
             faces = face_cascade.detectMultiScale(gray_face, scaleFactor=1.1, minNeighbors=4, minSize=(30, 30))
-            if len(faces) == 0:
-                save_skipped(frame_bgr, frame_index, float(timestamp_sec), "no_face")
+            if must_have_face and len(faces) == 0:
+                save_skipped(frame_bgr, frame_index, float(timestamp_sec), "indoor_no_face" if (cfg.indoor_require_face and not outdoor) else "no_face")
                 continue
-            areas = [(w * h) / float(frame_bgr.shape[0] * frame_bgr.shape[1] + 1e-9) for (x, y, w, h) in faces]
-            if max(areas) < cfg.min_face_area:
-                save_skipped(frame_bgr, frame_index, float(timestamp_sec), "face_small")
+            if len(faces) > 0:
+                areas = [(w * h) / float(frame_bgr.shape[0] * frame_bgr.shape[1] + 1e-9) for (x, y, w, h) in faces]
+                if must_have_face and max(areas) < cfg.min_face_area:
+                    save_skipped(frame_bgr, frame_index, float(timestamp_sec), "face_small")
+                    continue
+                # Prefer face ROIs for subject sharpness check when available
+                try:
+                    roi_rects = [(int(x), int(y), int(w), int(h)) for (x, y, w, h) in faces]
+                except Exception:
+                    pass
+        # If required, drop frames that have neither subject nor scenery
+        if getattr(cfg, 'require_scene_or_person', True):
+            has_subject = len(roi_rects) > 0
+            if (not has_subject) and (not scenic):
+                save_skipped(frame_bgr, frame_index, float(timestamp_sec), "no_scene_no_person")
                 continue
         # Text filter applied once per second during commit
 
+        # Pre-compute aesthetic without human bonuses for potential blur override on outdoor scenic
+        aesthetic_pre = compute_aesthetic_score(frame_bgr, has_face=False, has_person=False) if cfg.use_aesthetic else 0.0
+
         if cfg.min_sharpness and cfg.min_sharpness > 0:
             gray_sharp = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-            lap = cv2.Laplacian(gray_sharp, cv2.CV_64F)
-            lv = float(lap.var())
-            if lv < cfg.min_sharpness:
-                save_skipped(frame_bgr, frame_index, float(timestamp_sec), "blur")
-                blur_skipped += 1
-                continue
+            # If we have detected subjects (faces/persons), use their ROIs to assess sharpness
+            lv_subject = -1.0
+            if len(roi_rects) > 0:
+                try:
+                    for (x, y, w, h) in roi_rects:
+                        x0, y0 = max(0, int(x)), max(0, int(y))
+                        x1, y1 = min(W, int(x + w)), min(H, int(y + h))
+                        if x1 > x0 and y1 > y0:
+                            roi = gray_sharp[y0:y1, x0:x1]
+                            if roi.size > 0:
+                                lv_roi = float(cv2.Laplacian(roi, cv2.CV_64F).var())
+                                if lv_roi > lv_subject:
+                                    lv_subject = lv_roi
+                except Exception:
+                    lv_subject = -1.0
+            # Keep frame if subject ROI is sharp enough; otherwise fall back to full-frame sharpness
+            if len(roi_rects) > 0 and lv_subject >= float(cfg.min_sharpness):
+                pass
+            else:
+                lap = cv2.Laplacian(gray_sharp, cv2.CV_64F)
+                lv = float(lap.var())
+                if lv < cfg.min_sharpness:
+                    # Allow scenic outdoor frames when aesthetic is high even if globally blurry
+                    if getattr(cfg, 'outdoor_allow_scenery', False) and outdoor and scenic and cfg.use_aesthetic and (aesthetic_pre >= float(cfg.min_aesthetic)):
+                        pass
+                    else:
+                        save_skipped(frame_bgr, frame_index, float(timestamp_sec), "blur")
+                        blur_skipped += 1
+                        continue
 
         # Compute quality (cheap) and keep only the best within this second
-        q = compute_quality(frame_bgr, alpha=cfg.quality_alpha, beta=cfg.quality_beta)
+        # First pass: detect faces/persons if aesthetic scoring is enabled
+        has_face = False
+        has_person = False
+        if cfg.use_aesthetic and (face_cascade is not None or hog is not None):
+            gray_face = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            if face_cascade is not None:
+                faces = face_cascade.detectMultiScale(gray_face, scaleFactor=1.1, minNeighbors=4, minSize=(30, 30))
+                has_face = len(faces) > 0
+            if not has_face and hog is not None:
+                persons, _ = hog.detectMultiScale(gray_face)
+                has_person = len(persons) > 0
+        
+        aesthetic_score = compute_aesthetic_score(frame_bgr, has_face=has_face, has_person=has_person) if cfg.use_aesthetic else 0.0
+        # Enforce aesthetic threshold for all frames
+        if cfg.use_aesthetic and (aesthetic_score < float(cfg.min_aesthetic)):
+            save_skipped(frame_bgr, frame_index, float(timestamp_sec), "low_aesthetic")
+            continue
+        q = compute_quality(frame_bgr, alpha=cfg.quality_alpha, beta=cfg.quality_beta, 
+                           gamma=cfg.quality_gamma, aesthetic_score=aesthetic_score)
         if q > sec_best_q:
             sec_best_idx = frame_index
             sec_best_ts = float(timestamp_sec)
@@ -1084,8 +1329,29 @@ def process_video(
             sec_best_img = frame_bgr.copy()
             sec_best_q = q
 
+        # Progress meter (print every ~1000 frames based on original frame index)
+        if (frame_index + 1) >= next_log_frame:
+            denom = float(max(1, progress_total_frames))
+            pct = (float(min(frame_index + 1, progress_total_frames)) / denom) * 100.0
+            elapsed = max(0.0, time.time() - start_ts)
+            prog = (float(min(frame_index + 1, progress_total_frames)) / denom) if denom > 0 else 0.0
+            eta = (elapsed / prog - elapsed) if prog > 0 else 0.0
+            if getattr(cfg, 'progress_only', False):
+                try:
+                    print(f"\r[prog] {video_name} {min(frame_index+1, progress_total_frames)}/{int(denom)} ({pct:.1f}%) elapsed={int(elapsed)}s eta={int(eta)}s", end="", flush=True)
+                except Exception:
+                    pass
+            elif getattr(cfg, 'debug', False):
+                dprint(cfg, f"[prog] {video_name} frames {min(frame_index+1, progress_total_frames)}/{int(denom)} ({pct:.1f}%) elapsed={elapsed:.1f}s eta={eta:.1f}s committed={committed_count}")
+            next_log_frame += 1000
+
     # End of stream: commit the last second and finalize last group
     commit_sec_best(end=True)
+    if getattr(cfg, 'progress_only', False):
+        try:
+            print()
+        except Exception:
+            pass
     if group is not None:
         finalize_group(group)
         if group.best_frame_id is not None and group.best_embedding is not None:
@@ -1153,7 +1419,7 @@ def process_video(
 
     final_entries = deduplicate_selected(selected_entries) if cfg.dedup_threshold and cfg.dedup_threshold > 0 else selected_entries
 
-    # Final blur prune on saved outputs
+    # Final blur prune on saved outputs (prefer subject ROI sharpness if available)
     removed_blurry = 0
     pruned_entries: list = []
     for r in final_entries:
@@ -1163,8 +1429,43 @@ def process_video(
             img = cv2.imread(imgp)
             if img is not None:
                 g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                lv = float(cv2.Laplacian(g, cv2.CV_64F).var())
-                if cfg.min_sharpness and lv < cfg.min_sharpness:
+                H2, W2 = g.shape[:2]
+                roi_rects2: List[Tuple[int, int, int, int]] = []
+                if cfg.face_filter and face_cascade is not None:
+                    try:
+                        faces2 = face_cascade.detectMultiScale(g, scaleFactor=1.1, minNeighbors=4, minSize=(30, 30))
+                        for (x, y, w, h) in faces2:
+                            roi_rects2.append((int(x), int(y), int(w), int(h)))
+                    except Exception:
+                        pass
+                if cfg.person_filter and hog is not None and len(roi_rects2) == 0:
+                    try:
+                        rects2, _ = hog.detectMultiScale(g, winStride=(8, 8), padding=(8, 8), scale=1.05)
+                        for (x, y, w, h) in rects2:
+                            roi_rects2.append((int(x), int(y), int(w), int(h)))
+                    except Exception:
+                        pass
+                lv_subject2 = -1.0
+                if len(roi_rects2) > 0:
+                    try:
+                        for (x, y, w, h) in roi_rects2:
+                            x0, y0 = max(0, int(x)), max(0, int(y))
+                            x1, y1 = min(W2, int(x + w)), min(H2, int(y + h))
+                            if x1 > x0 and y1 > y0:
+                                roi2 = g[y0:y1, x0:x1]
+                                if roi2.size > 0:
+                                    lv_roi2 = float(cv2.Laplacian(roi2, cv2.CV_64F).var())
+                                    if lv_roi2 > lv_subject2:
+                                        lv_subject2 = lv_roi2
+                    except Exception:
+                        lv_subject2 = -1.0
+                keep_frame = False
+                if len(roi_rects2) > 0 and lv_subject2 >= float(cfg.min_sharpness):
+                    keep_frame = True
+                else:
+                    lv_full = float(cv2.Laplacian(g, cv2.CV_64F).var())
+                    keep_frame = (not cfg.min_sharpness) or (lv_full >= float(cfg.min_sharpness))
+                if not keep_frame:
                     storage.set_representative(r["frame_id"], False)
                     try:
                         if _skip_should_save(img):
@@ -1202,6 +1503,342 @@ def process_video(
 
 
 # -------------------------------
+# Two-pass pipeline
+# -------------------------------
+
+def process_video_two_pass(
+    video_path: str,
+    output_dir: str,
+    db_path: str,
+    cfg: ProcessingConfig,
+    video_idx: int = 1,
+    total_videos: int = 1,
+) -> Tuple[str, list]:
+    os.makedirs(output_dir, exist_ok=True)
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    program_name = os.path.splitext(os.path.basename(__file__))[0]
+    video_out_dir = os.path.join(output_dir, program_name, video_name)
+
+    cap0 = cv2.VideoCapture(video_path)
+    if not cap0.isOpened():
+        raise RuntimeError(f"Failed to open video: {video_path}")
+    width = int(cap0.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(cap0.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    fps = float(cap0.get(cv2.CAP_PROP_FPS) or 0.0)
+    frame_count = int(cap0.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    duration_sec = (frame_count / fps) if (frame_count > 0 and fps > 0) else None
+    cap0.release()
+    # Progress denominator capped by max_seconds if provided
+    progress_total_frames = frame_count
+    if cfg.max_seconds is not None and float(cfg.max_seconds) > 0 and fps > 0:
+        limit_frames = int(round(float(cfg.max_seconds) * float(fps)))
+        progress_total_frames = min(frame_count, limit_frames)
+
+    if os.path.exists(video_out_dir):
+        shutil.rmtree(video_out_dir)
+    os.makedirs(video_out_dir, exist_ok=True)
+    skipped_dir = os.path.join(video_out_dir, "skipped")
+    os.makedirs(skipped_dir, exist_ok=True)
+
+    storage = DuckDBStorage(db_path)
+    video_id = storage.get_or_create_video(video_path, width, height, fps, frame_count if frame_count > 0 else None, duration_sec)
+    run_id = uuid.uuid4().hex
+
+    model, device, _, mean, std = load_model(device=cfg.device, pretrained=cfg.pretrained, backbone=cfg.backbone)
+    dprint(cfg, f"[2pass:init] {video_name} fps={fps:.2f} frames={frame_count} frame_skip={cfg.frame_skip} device={device}")
+
+    face_cascade = None
+    if cfg.face_filter or cfg.indoor_require_face:
+        try:
+            cascade_path = os.path.join(cv2.data.haarcascades, 'haarcascade_frontalface_default.xml')
+            if os.path.exists(cascade_path):
+                face_cascade = cv2.CascadeClassifier(cascade_path)
+        except Exception:
+            face_cascade = None
+    hog = None
+    if cfg.person_filter:
+        try:
+            hog = cv2.HOGDescriptor()
+            hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        except Exception:
+            hog = None
+
+    skip_hashes: list[int] = []
+    skip_vecs: list[np.ndarray] = []
+
+    def _ahash64(img: np.ndarray) -> int:
+        try:
+            g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        except Exception:
+            return 0
+        small = cv2.resize(g, (8, 8), interpolation=cv2.INTER_AREA)
+        m = float(small.mean())
+        bits = (small > m).astype(np.uint8).flatten()
+        h = 0
+        for i in range(64):
+            if int(bits[i]):
+                h |= (1 << i)
+        return int(h)
+
+    def _vec32(img: np.ndarray) -> np.ndarray:
+        try:
+            g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        except Exception:
+            return np.zeros((1024,), dtype=np.float32)
+        small = cv2.resize(g, (32, 32), interpolation=cv2.INTER_AREA).astype(np.float32)
+        v = small.reshape(-1)
+        v -= float(v.mean())
+        std = float(v.std()) + 1e-6
+        v /= std
+        n = float(np.linalg.norm(v)) + 1e-6
+        return (v / n).astype(np.float32)
+
+    def _skip_should_save(img: np.ndarray, thr_hash: int = 6, thr_cos: float = 0.10) -> bool:
+        h = _ahash64(img)
+        for prev in skip_hashes:
+            if (h ^ prev).bit_count() <= thr_hash:
+                return False
+        v = _vec32(img)
+        if len(skip_vecs) > 0:
+            dots = np.dot(np.vstack(skip_vecs), v)
+            dists = 1.0 - dots
+            if float(dists.min()) <= thr_cos:
+                return False
+        skip_hashes.append(h)
+        skip_vecs.append(v)
+        return True
+
+    def save_skipped(img: np.ndarray, idx: int, ts: float, reason: str) -> None:
+        try:
+            if not _skip_should_save(img):
+                return
+            fname = f"{idx:09d}_{reason}.jpg"
+            cv2.imwrite(os.path.join(skipped_dir, fname), img, [int(cv2.IMWRITE_JPEG_QUALITY), cfg.save_jpeg_quality])
+        except Exception:
+            pass
+
+    processed = 0
+    start_ts1 = time.time()
+    next_log_frame1 = 1000
+    for frame_index, timestamp_sec, frame_bgr in extract_frames(video_path, frame_skip=cfg.frame_skip, max_frames=cfg.max_frames):
+        if cfg.max_seconds is not None and timestamp_sec is not None and timestamp_sec >= float(cfg.max_seconds):
+            break
+        H, W = frame_bgr.shape[:2]
+        roi_rects: List[Tuple[int, int, int, int]] = []
+        outdoor = is_likely_outdoor(frame_bgr)
+        scenic = is_scenic(frame_bgr, edge_min=cfg.scenic_edge_min, sat_min=cfg.scenic_sat_min, brightness_min=cfg.scenic_brightness_min)
+
+        if cfg.person_filter and hog is not None and not (getattr(cfg, 'outdoor_allow_scenery', False) and outdoor):
+            gray_p = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            rects, _ = hog.detectMultiScale(gray_p, winStride=(8, 8), padding=(8, 8), scale=1.05)
+            if len(rects) == 0:
+                save_skipped(frame_bgr, frame_index, float(timestamp_sec), "no_person")
+                continue
+            max_ratio = 0.0
+            for (x, y, w, h) in rects:
+                max_ratio = max(max_ratio, (float(w) * float(h)) / float(W * H + 1e-9))
+            if max_ratio < cfg.min_person_area:
+                save_skipped(frame_bgr, frame_index, float(timestamp_sec), "person_small")
+                continue
+            try:
+                roi_rects = [(int(x), int(y), int(w), int(h)) for (x, y, w, h) in rects]
+            except Exception:
+                roi_rects = []
+
+        must_have_face = (cfg.face_filter or (cfg.indoor_require_face and not outdoor))
+        has_face = False
+        if (cfg.face_filter or cfg.indoor_require_face) and face_cascade is not None:
+            gray_face = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(gray_face, scaleFactor=1.1, minNeighbors=4, minSize=(30, 30))
+            if must_have_face and len(faces) == 0:
+                save_skipped(frame_bgr, frame_index, float(timestamp_sec), "indoor_no_face" if (cfg.indoor_require_face and not outdoor) else "no_face")
+                continue
+            if len(faces) > 0:
+                has_face = True
+                areas = [(w * h) / float(H * W + 1e-9) for (x, y, w, h) in faces]
+                if must_have_face and max(areas) < cfg.min_face_area:
+                    save_skipped(frame_bgr, frame_index, float(timestamp_sec), "face_small")
+                    continue
+                try:
+                    roi_rects = [(int(x), int(y), int(w), int(h)) for (x, y, w, h) in faces]
+                except Exception:
+                    pass
+
+        if getattr(cfg, 'require_scene_or_person', True):
+            has_subject = len(roi_rects) > 0
+            if (not has_subject) and (not scenic):
+                save_skipped(frame_bgr, frame_index, float(timestamp_sec), "no_scene_no_person")
+                continue
+
+        if cfg.text_filter:
+            if is_text_prominent(
+                frame_bgr,
+                cfg.text_area_threshold,
+                cfg.text_bottom_ratio,
+                method=getattr(cfg, 'text_method', 'fast'),
+                subtitle_tolerant=getattr(cfg, 'subtitle_tolerant', True),
+                subtitle_h_ratio=getattr(cfg, 'subtitle_max_rel_height', 0.12),
+            ):
+                save_skipped(frame_bgr, frame_index, float(timestamp_sec), "text")
+                continue
+
+        scenic_blur = False
+        if cfg.min_sharpness and cfg.min_sharpness > 0:
+            gray_sharp = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            lv_subject = -1.0
+            if len(roi_rects) > 0:
+                try:
+                    for (x, y, w, h) in roi_rects:
+                        x0, y0 = max(0, int(x)), max(0, int(y))
+                        x1, y1 = min(W, int(x + w)), min(H, int(y + h))
+                        if x1 > x0 and y1 > y0:
+                            roi = gray_sharp[y0:y1, x0:x1]
+                            if roi.size > 0:
+                                lv_roi = float(cv2.Laplacian(roi, cv2.CV_64F).var())
+                                if lv_roi > lv_subject:
+                                    lv_subject = lv_roi
+                except Exception:
+                    lv_subject = -1.0
+            if len(roi_rects) > 0 and lv_subject >= float(cfg.min_sharpness):
+                pass
+            else:
+                lap = cv2.Laplacian(gray_sharp, cv2.CV_64F)
+                lv = float(lap.var())
+                if lv < cfg.min_sharpness:
+                    scenic_blur = True
+
+        has_person = len(roi_rects) > 0
+        aest = compute_aesthetic_score(frame_bgr, has_face=has_face, has_person=has_person) if cfg.use_aesthetic else 0.0
+        if scenic_blur:
+            if not (getattr(cfg, 'outdoor_allow_scenery', False) and is_likely_outdoor(frame_bgr) and aest >= float(cfg.min_aesthetic)):
+                save_skipped(frame_bgr, frame_index, float(timestamp_sec), "blur")
+                continue
+
+        if cfg.use_aesthetic and aest < float(cfg.min_aesthetic):
+            save_skipped(frame_bgr, frame_index, float(timestamp_sec), "low_aesthetic")
+            continue
+
+        emb = compute_embedding(model, frame_bgr, device, cfg.resize_shorter, cfg.model_input_size, mean, std)
+        q = compute_quality(frame_bgr, alpha=cfg.quality_alpha, beta=cfg.quality_beta, gamma=cfg.quality_gamma, aesthetic_score=aest)
+        fid = storage.insert_frame(video_id=video_id, frame_index=frame_index, timestamp_sec=float(timestamp_sec), quality=q, group_id=None, is_representative=False, run_id=run_id, aesthetic=aest)
+        storage.insert_embedding(fid, emb)
+        processed += 1
+        if getattr(cfg, 'progress_only', False):
+            denom = float(max(1, progress_total_frames))
+            cur = min(frame_index + 1, progress_total_frames)
+            pct = (float(cur) / denom) * 100.0
+            elapsed = max(0.0, time.time() - start_ts1)
+            prog = (float(cur) / denom) if denom > 0 else 0.0
+            eta = (elapsed / prog - elapsed) if prog > 0 else 0.0
+            if (frame_index + 1) >= next_log_frame1:
+                try:
+                    print(f"\r[pass1] {video_name} {cur}/{int(denom)} ({pct:.1f}%) elapsed={int(elapsed)}s eta={int(eta)}s", end="", flush=True)
+                except Exception:
+                    pass
+                next_log_frame1 += 1000
+
+    if getattr(cfg, 'progress_only', False):
+        try:
+            print()
+        except Exception:
+            pass
+
+    cand = storage.fetch_frames_with_embeddings(video_id, run_id)
+    if duration_sec is None:
+        duration_est = max([r[1] for r in cand], default=0.0)
+    else:
+        duration_est = float(duration_sec)
+    usable_sec = duration_est
+    if cfg.max_seconds is not None and cfg.max_seconds > 0:
+        usable_sec = min(usable_sec, float(cfg.max_seconds))
+    max_keep = max(1, int(usable_sec / max(1e-6, float(cfg.sec_per_image))))
+
+    kept_rows: list = []
+    pruned: set = set()
+    total_cand = len(cand)
+    start_ts2 = time.time()
+    log_every2 = max(1, total_cand // 100) if total_cand > 0 else 1
+    for i, (fi, ts, aest, q, fid, v) in enumerate(cand):
+        if len(kept_rows) >= max_keep:
+            break
+        if fid in pruned:
+            continue
+        # Select this as top remaining, then mark its near-duplicates unavailable
+        kept_rows.append((fi, ts, q, fid))
+        for j in range(i + 1, len(cand)):
+            fi2, ts2, aest2, q2, fid2, v2 = cand[j]
+            if fid2 in pruned:
+                continue
+            dist = float(1.0 - float(np.dot(v, v2)))
+            if dist < float(cfg.dedup_threshold):
+                pruned.add(fid2)
+        if getattr(cfg, 'progress_only', False) and (total_cand > 0) and (((i + 1) % log_every2 == 0) or (i + 1 == total_cand)):
+            denom2 = float(max(1, total_cand))
+            pct2 = (float(i + 1) / denom2) * 100.0
+            elapsed2 = max(0.0, time.time() - start_ts2)
+            prog2 = (float(i + 1) / denom2) if denom2 > 0 else 0.0
+            eta2 = (elapsed2 / prog2 - elapsed2) if prog2 > 0 else 0.0
+            try:
+                print(f"\r[pass2-select] {video_name} scanned={i+1}/{int(denom2)} ({pct2:.1f}%) kept={len(kept_rows)} pruned={len(pruned)} elapsed={int(elapsed2)}s eta={int(eta2)}s", end="", flush=True)
+            except Exception:
+                pass
+
+    if getattr(cfg, 'progress_only', False):
+        try:
+            print()
+        except Exception:
+            pass
+
+    # Save images for kept
+    cap = cv2.VideoCapture(video_path)
+    save_total = len(kept_rows)
+    start_ts2save = time.time()
+    for rank, (fi, ts, q, fid) in enumerate(kept_rows, start=1):
+        try:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
+        except Exception:
+            pass
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            continue
+        save_path = os.path.join(video_out_dir, f"top_{rank:06d}_{fi:09d}.jpg")
+        cv2.imwrite(save_path, frame, [int(cv2.IMWRITE_JPEG_QUALITY), cfg.save_jpeg_quality])
+        storage.set_representative(fid, True)
+        if getattr(cfg, 'progress_only', False):
+            denom_s = float(max(1, save_total))
+            pct_s = (float(rank) / denom_s) * 100.0
+            elapsed_s = max(0.0, time.time() - start_ts2save)
+            prog_s = (float(rank) / denom_s) if denom_s > 0 else 0.0
+            eta_s = (elapsed_s / prog_s - elapsed_s) if prog_s > 0 else 0.0
+            try:
+                print(f"\r[pass2-save] {video_name} {rank}/{int(denom_s)} ({pct_s:.1f}%) elapsed={int(elapsed_s)}s eta={int(eta_s)}s", end="", flush=True)
+            except Exception:
+                pass
+    cap.release()
+    if getattr(cfg, 'progress_only', False):
+        try:
+            print()
+        except Exception:
+            pass
+
+    # Summary
+    csv_path = os.path.join(video_out_dir, "summary.csv")
+    with open(csv_path, "w", encoding="utf-8") as f:
+        f.write("frame_index,timestamp,quality,frame_id\n")
+        for (fi, ts, q, fid) in kept_rows:
+            f.write(f"{fi},{ts:.6f},{q:.6f},{fid}\n")
+
+    out_entries = [
+        {"frame_index": int(fi), "timestamp": float(ts), "quality": float(q), "frame_id": fid}
+        for (fi, ts, q, fid) in kept_rows
+    ]
+    try:
+        storage.close()
+    except Exception:
+        pass
+    return video_id, out_entries
+
+# -------------------------------
 # CLI
 # -------------------------------
 
@@ -1217,10 +1854,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model-input-size", type=int, default=224, help="Model input crop size (default 224)")
     p.add_argument("--quality-alpha", type=float, default=1.0, help="Weight for Laplacian variance sharpness score (default 1.0)")
     p.add_argument("--quality-beta", type=float, default=0.0, help="Optional weight for grayscale std contrast term (default 0.0)")
+    p.add_argument("--quality-gamma", type=float, default=0.5, help="Weight for aesthetic score (visual appeal) (default 0.5)")
     p.add_argument("--device", type=str, default=None, help="Force device: 'cuda', 'mps', or 'cpu' (default: auto)")
     p.add_argument("--no-pretrained", action="store_true", help="Disable pretrained weights (fallback to random)")
     p.add_argument("--jpeg-quality", type=int, default=95, help="JPEG quality for saving selected frames (default 95)")
     p.add_argument("--max-frames", type=int, default=None, help="Optional cap on number of processed frames (debug)")
+    p.add_argument("--max-seconds", "--max-duration", dest="max_seconds", type=float, default=None, help="Optional cap on processed seconds per video")
     p.add_argument("--backbone", type=str, default="resnet50", help="timm model name (e.g., 'resnet50', 'efficientnet_b0')")
     p.add_argument("--dedup-threshold", type=float, default=0.07, help="Cosine distance threshold to treat two selected frames as duplicates (default 0.07)")
     # Filters
@@ -1231,18 +1870,35 @@ def parse_args() -> argparse.Namespace:
     if boolean_action is not None:
         p.add_argument("--face-filter", action=boolean_action, default=False, help="Require at least one detected face per frame (default: disabled)")
         p.add_argument("--video-face-filter", action=boolean_action, default=False, help="Skip entire video if no prominent face appears (default: disabled)")
+        p.add_argument("--indoor-require-face", action=boolean_action, default=True, help="If a frame is likely indoor and no face is present, drop the frame (default: enabled)")
+        p.add_argument("--outdoor-allow-scenery", action=boolean_action, default=False, help="If outdoor and scenery is good, allow frames without people/faces (default: disabled)")
         p.add_argument("--person-filter", action=boolean_action, default=True, help="Require at least one prominent person per frame (OpenCV HOG) (default: enabled)")
         p.add_argument("--text-filter", action=boolean_action, default=False, help="Skip frames with prominent text overlays (default: disabled)")
         p.add_argument("--subtitle-tolerant", action=boolean_action, default=True, help="Do not treat short bottom subtitles as prominent text (default: enabled)")
+        p.add_argument("--progress-only", action=boolean_action, default=False, help="Show only a single-line progress meter while processing (default: disabled)")
+        p.add_argument("--require-scene-or-person", action=boolean_action, default=True, help="Drop frames that have neither scenery nor person (default: enabled)")
+        p.add_argument("--use-aesthetic", action=boolean_action, default=True, help="Enable aesthetic scoring for more visually appealing images (default: enabled)")
+        p.add_argument("--two-pass", action=boolean_action, default=True, help="Enable two-pass selection (store all embeddings+aesthetic, then pick unique top) (default: enabled)")
     else:
         p.add_argument("--face-filter", action="store_true", help="Require at least one detected face per frame")
         p.add_argument("--video-face-filter", action="store_true", help="Skip entire video if no prominent face appears")
+        p.add_argument("--indoor-require-face", action="store_true", help="If a frame is likely indoor and no face is present, drop the frame")
+        p.add_argument("--outdoor-allow-scenery", action="store_true", help="If outdoor and scenery is good, allow frames without people/faces")
         p.add_argument("--person-filter", action="store_true", help="Require at least one prominent person per frame (OpenCV HOG)")
         p.add_argument("--text-filter", action="store_true", help="Skip frames with prominent text overlays")
         p.add_argument("--subtitle-tolerant", action="store_true", help="Do not treat short bottom subtitles as prominent text")
+        p.add_argument("--progress-only", action="store_true", help="Show only a single-line progress meter while processing")
+        p.add_argument("--require-scene-or-person", action="store_true", help="Drop frames that have neither scenery nor person")
+        p.add_argument("--use-aesthetic", action="store_true", default=True, help="Enable aesthetic scoring for more visually appealing images (default: enabled)")
+        p.add_argument("--two-pass", action="store_true", default=True, help="Enable two-pass selection (store all embeddings+aesthetic, then pick unique top) (default: enabled)")
     p.add_argument("--min-sharpness", type=float, default=50.0, help="Discard frames with Laplacian variance below this (default 50.0)")
     p.add_argument("--min-face-area", type=float, default=0.015, help="Minimum face area ratio (bbox area / frame area) to be considered prominent (default 0.015)")
     p.add_argument("--min-person-area", type=float, default=0.08, help="Minimum person bbox area ratio to be considered prominent (default 0.08)")
+    p.add_argument("--min-aesthetic", type=float, default=25.0, help="Minimum aesthetic score required to keep a frame (default 25.0)")
+    p.add_argument("--sec-per-image", type=float, default=10.0, help="Max selected images ~= duration_sec / sec_per_image (default 10)")
+    p.add_argument("--scenic-edge-min", type=float, default=0.015, help="Minimum edge density to consider frame scenic (default 0.015)")
+    p.add_argument("--scenic-sat-min", type=float, default=0.12, help="Minimum average saturation to consider frame scenic (default 0.12)")
+    p.add_argument("--scenic-brightness-min", type=float, default=0.12, help="Minimum average brightness to consider frame scenic (default 0.12)")
     p.add_argument("--text-method", type=str, default="fast", choices=["fast", "mser"], help="Text detection method: 'fast' (edge) or 'mser' (slower)")
     p.add_argument("--text-area-threshold", type=float, default=0.08, help="Text area ratio threshold to treat overlays as prominent (default 0.08)")
     p.add_argument("--text-bottom-ratio", type=float, default=0.4, help="Bottom region proportion emphasized for subtitles (default 0.4)")
@@ -1262,10 +1918,13 @@ def main():
         model_input_size=args.model_input_size,
         quality_alpha=args.quality_alpha,
         quality_beta=args.quality_beta,
+        quality_gamma=getattr(args, 'quality_gamma', 0.5),
+        use_aesthetic=getattr(args, 'use_aesthetic', True),
         device=args.device,
         pretrained=not args.no_pretrained,
         save_jpeg_quality=args.jpeg_quality,
         max_frames=args.max_frames,
+        max_seconds=getattr(args, 'max_seconds', None),
         backbone=args.backbone,
         dedup_threshold=args.dedup_threshold,
         face_filter=getattr(args, 'face_filter', True),
@@ -1274,14 +1933,24 @@ def main():
         min_face_area=args.min_face_area,
         min_face_frames=args.min_face_frames,
         debug=getattr(args, 'debug', False),
+        indoor_require_face=getattr(args, 'indoor_require_face', True),
         person_filter=getattr(args, 'person_filter', True),
         min_person_area=args.min_person_area,
+        min_aesthetic=getattr(args, 'min_aesthetic', 25.0),
+        require_scene_or_person=getattr(args, 'require_scene_or_person', True),
+        scenic_edge_min=getattr(args, 'scenic_edge_min', 0.015),
+        scenic_sat_min=getattr(args, 'scenic_sat_min', 0.12),
+        scenic_brightness_min=getattr(args, 'scenic_brightness_min', 0.12),
         text_filter=getattr(args, 'text_filter', False),
         text_area_threshold=args.text_area_threshold,
         text_bottom_ratio=args.text_bottom_ratio,
         text_method=getattr(args, 'text_method', 'fast'),
         subtitle_tolerant=getattr(args, 'subtitle_tolerant', True),
         subtitle_max_rel_height=args.subtitle_max_rel_height,
+        progress_only=getattr(args, 'progress_only', False),
+        outdoor_allow_scenery=getattr(args, 'outdoor_allow_scenery', False),
+        two_pass=getattr(args, 'two_pass', True),
+        sec_per_image=getattr(args, 'sec_per_image', 10.0),
     )
 
     inputs = find_videos(args.input)
@@ -1293,7 +1962,10 @@ def main():
     total_time = 0.0
     for i, vp in enumerate(inputs, start=1):
         t0 = time.time()
-        video_id, selected = process_video(vp, args.output, args.db, cfg, video_idx=i, total_videos=len(inputs))
+        if getattr(cfg, 'two_pass', True):
+            video_id, selected = process_video_two_pass(vp, args.output, args.db, cfg, video_idx=i, total_videos=len(inputs))
+        else:
+            video_id, selected = process_video(vp, args.output, args.db, cfg, video_idx=i, total_videos=len(inputs))
         dt = time.time() - t0
         total_time += dt
         grand_total += len(selected)
@@ -1308,7 +1980,8 @@ def main():
             for r in selected:
                 print(f"- frame_index={r['frame_index']} ts={r['timestamp']:.3f}s quality={r['quality']:.2f} frame_id={r['frame_id']}")
             video_name = os.path.splitext(os.path.basename(vp))[0]
-            video_out_dir = os.path.join(args.output, video_name)
+            program_name = os.path.splitext(os.path.basename(__file__))[0]
+            video_out_dir = os.path.join(args.output, program_name, video_name)
             print(f"Outputs: images_dir={video_out_dir} summary={os.path.join(video_out_dir, 'summary.csv')}")
 
     print(f"\n# Aggregate")

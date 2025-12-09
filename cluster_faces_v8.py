@@ -213,7 +213,8 @@ def annotate_segment_opencv(
     if _USE_BANDPASS:
         filter_chain_parts.append('highpass=f=200,lowpass=f=3800,afftdn=nf=-25,alimiter=limit=0.95')
     if gating_expr:
-        filter_chain_parts.append(f"volume=if(gt({gating_expr},0),1,0)")
+        esc = gating_expr.replace(',', '\\,')
+        filter_chain_parts.append(f"volume=if(gt({esc}\\,0)\\,1\\,0):eval=frame")
     # ensure sane format
     filter_chain_parts.append('aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo')
 
