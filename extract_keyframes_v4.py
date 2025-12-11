@@ -24,7 +24,6 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     FaceAnalysis = None
 
-
 # ============================================================
 # Global configuration
 # ============================================================
@@ -37,15 +36,45 @@ _CLIP_MODEL = None
 _CLIP_PREPROCESS = None
 _AESTHETIC_HEAD = None
 _AESTHETIC_DEVICE = None
-
 _FACE_ANALYZER: Optional[FaceAnalysis] = None
 
+
+# Recommended default technical cutoffs for gallery/stock usage
+MIN_TECH_SCORE = 70.0       # overall technical quality 0–100
+MIN_RES_LONG_EDGE = 320     # minimum width or height in pixels
+MIN_TOTAL_PIXELS = 200_000  # ~0.2 MP
+MIN_SHARPNESS_VAR = 80.0    # absolute minimum accept, below = junk
+MAX_NOISE_SIGMA = 0.12      # hard upper bound on noise
+MAX_CLIP_PCT = 0.05         # >5% clipped is too much
+
+# Composition defaults
+MIN_COMPOSITION_SCORE = 60.0
+
+# Face framing defaults
+MIN_FACE_MIN_DIM_RATIO = 0.12  # minimum fraction of shorter edge for face min dimension
+FACE_ASPECT_MIN = 0.6
+FACE_ASPECT_MAX = 1.8
+
+EVAL_MAX_EDGE = 720
+
+
+def _downscale_for_eval(frame_bgr: np.ndarray, max_edge: int = EVAL_MAX_EDGE) -> np.ndarray:
+    if max_edge <= 0:
+        return frame_bgr
+    h, w = frame_bgr.shape[:2]
+    long_edge = max(h, w)
+    if long_edge <= max_edge:
+        return frame_bgr
+    scale = max_edge / float(long_edge)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    return cv2.resize(frame_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
 # ============================================================
 # Embedding model (timm)
 # ============================================================
 
-def _ensure_embedding_model_loaded(model_name: str = "resnet50") -> None:
+def _ensure_embedding_model_loaded(model_name: str = "mobilenetv3_small_050") -> None:
     global _EMB_MODEL, _EMB_TRANSFORM, _DEVICE
     if _EMB_MODEL is not None and _EMB_TRANSFORM is not None:
         return
@@ -71,7 +100,8 @@ def compute_embedding(frame_bgr: np.ndarray) -> np.ndarray:
     assert _EMB_MODEL is not None and _EMB_TRANSFORM is not None
     assert _DEVICE is not None
 
-    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    frame_for_eval = _downscale_for_eval(frame_bgr)
+    rgb = cv2.cvtColor(frame_for_eval, cv2.COLOR_BGR2RGB)
     pil_img = Image.fromarray(rgb)
 
     with torch.no_grad():
@@ -87,8 +117,7 @@ def compute_embedding(frame_bgr: np.ndarray) -> np.ndarray:
 # CLIP + LAION Aesthetic Predictor
 # ============================================================
 
-
-def _get_laion_aesthetic_head(clip_model_short: str = "vit_l_14") -> torch.nn.Module:
+def _get_laion_aesthetic_head(clip_model_short: str = "vit_b_32") -> torch.nn.Module:
     """
     Load the LAION aesthetic linear head for the given CLIP backbone.
     Weights from: https://github.com/LAION-AI/aesthetic-predictor
@@ -127,9 +156,9 @@ def _ensure_aesthetic_models_loaded() -> None:
         return
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Loading CLIP ViT-L/14 on {device} for aesthetic scoring...")
-    clip_model, preprocess = clip.load("ViT-L/14", device=device)  # type: ignore
-    aesthetic_head = _get_laion_aesthetic_head("vit_l_14").to(device)
+    print(f"Loading CLIP ViT-B/32 on {device} for aesthetic scoring...")
+    clip_model, preprocess = clip.load("ViT-B/32", device=device)  # type: ignore
+    aesthetic_head = _get_laion_aesthetic_head("vit_b_32").to(device)
 
     _CLIP_MODEL = clip_model
     _CLIP_PREPROCESS = preprocess
@@ -163,17 +192,19 @@ def compute_aesthetic_score(frame_bgr: np.ndarray) -> float:
 # ============================================================
 
 
-def compute_technical_quality(frame_bgr: np.ndarray) -> dict:
+def compute_technical_quality(frame_bgr: np.ndarray, eval_max_edge: int = EVAL_MAX_EDGE) -> dict:
     """Compute technical metrics and an overall technical quality score."""
     h, w = frame_bgr.shape[:2]
     total_pixels = int(h * w)
 
+    eval_img = _downscale_for_eval(frame_bgr, eval_max_edge)
+
     # Sharpness (variance of Laplacian)
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(eval_img, cv2.COLOR_BGR2GRAY)
     sharpness_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
     # Prepare RGB float image
-    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    rgb = cv2.cvtColor(eval_img, cv2.COLOR_BGR2RGB)
     rgb_f = rgb.astype(np.float32) / 255.0
 
     # Noise estimation (per channel, mean)
@@ -259,16 +290,11 @@ def _ensure_face_analyzer_loaded() -> None:
         return
     if _FACE_ANALYZER is None:
         try:
-            _FACE_ANALYZER = FaceAnalysis(name="buffalo_l")
+            _FACE_ANALYZER = FaceAnalysis(name="buffalo_sc")
             ctx_id = 0 if torch.cuda.is_available() else -1
-            _FACE_ANALYZER.prepare(ctx_id=ctx_id, det_size=(640, 640))
+            _FACE_ANALYZER.prepare(ctx_id=ctx_id, det_size=(512, 512))
         except Exception:
             _FACE_ANALYZER = None
-
-
-# ============================================================
-# Face detection and composition scoring
-# ============================================================
 
 
 def compute_face_features(frame_bgr: np.ndarray) -> dict:
@@ -438,267 +464,6 @@ def compute_composition_features(frame_bgr: np.ndarray, face_info: dict | None =
         "centered_score": centered_score,
         "edge_proximity_score": edge_proximity_score,
         "composition_score": composition_score,
-    }
-
-
-#!/usr/bin/env python3
-import argparse
-import os
-import shutil
-from typing import List, Tuple, Optional
-
-import cv2
-import duckdb  # type: ignore
-import numpy as np
-import torch
-import torch.nn.functional as F
-import timm
-from timm.data import resolve_model_data_config, create_transform
-
-import clip  # type: ignore
-from PIL import Image
-from urllib.request import urlretrieve
-import skimage
-from skimage import restoration, exposure, color
-
-try:
-    from insightface.app import FaceAnalysis  # type: ignore
-except ImportError:  # pragma: no cover - optional dependency
-    FaceAnalysis = None
-
-# ============================================================
-# Global configuration
-# ============================================================
-
-_EMB_MODEL = None
-_EMB_TRANSFORM = None
-_DEVICE = None
-
-_CLIP_MODEL = None
-_CLIP_PREPROCESS = None
-_AESTHETIC_HEAD = None
-_AESTHETIC_DEVICE = None
-
-
-# Recommended default technical cutoffs for gallery/stock usage
-MIN_TECH_SCORE = 70.0       # overall technical quality 0–100
-MIN_RES_LONG_EDGE = 320     # minimum width or height in pixels
-MIN_TOTAL_PIXELS = 200_000  # ~0.2 MP
-MIN_SHARPNESS_VAR = 80.0    # absolute minimum accept, below = junk
-MAX_NOISE_SIGMA = 0.12      # hard upper bound on noise
-MAX_CLIP_PCT = 0.05         # >5% clipped is too much
-
-# Composition defaults
-MIN_COMPOSITION_SCORE = 60.0
-
-# Face framing defaults
-MIN_FACE_MIN_DIM_RATIO = 0.12  # minimum fraction of shorter edge for face min dimension
-FACE_ASPECT_MIN = 0.6
-FACE_ASPECT_MAX = 1.8
-
-# ============================================================
-# Embedding model (timm)
-# ============================================================
-
-def _ensure_embedding_model_loaded(model_name: str = "resnet50") -> None:
-    global _EMB_MODEL, _EMB_TRANSFORM, _DEVICE
-    if _EMB_MODEL is not None and _EMB_TRANSFORM is not None:
-        return
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = timm.create_model(model_name, pretrained=True, num_classes=0)  # feature extractor
-    model.eval().to(device)
-
-    config = resolve_model_data_config(model)
-    transform = create_transform(**config)
-
-    _EMB_MODEL = model
-    _EMB_TRANSFORM = transform
-    _DEVICE = device
-
-
-def compute_embedding(frame_bgr: np.ndarray) -> np.ndarray:
-    """
-    Compute a feature embedding for a frame using a timm model.
-    Returns a 1D numpy array.
-    """
-    _ensure_embedding_model_loaded()
-    assert _EMB_MODEL is not None and _EMB_TRANSFORM is not None
-    assert _DEVICE is not None
-
-    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    pil_img = Image.fromarray(rgb)
-
-    with torch.no_grad():
-        x = _EMB_TRANSFORM(pil_img).unsqueeze(0).to(_DEVICE)
-        feat = _EMB_MODEL(x)  # (1, D)
-        feat = F.normalize(feat, dim=-1)
-        feat_np = feat.squeeze(0).cpu().numpy().astype(np.float32)
-
-    return feat_np
-
-
-# ============================================================
-# CLIP + LAION Aesthetic Predictor
-# ============================================================
-
-def _get_laion_aesthetic_head(clip_model_short: str = "vit_l_14") -> torch.nn.Module:
-    """
-    Load the LAION aesthetic linear head for the given CLIP backbone.
-    Weights from: https://github.com/LAION-AI/aesthetic-predictor
-    """
-    home = os.path.expanduser("~")
-    cache_folder = os.path.join(home, ".cache", "laion_aesthetic")
-    os.makedirs(cache_folder, exist_ok=True)
-    path_to_model = os.path.join(cache_folder, f"sa_0_4_{clip_model_short}_linear.pth")
-
-    if not os.path.exists(path_to_model):
-        if clip_model_short not in ("vit_l_14", "vit_b_32"):
-            raise ValueError(f"Unsupported clip_model_short: {clip_model_short}")
-        url_model = (
-            f"https://github.com/LAION-AI/aesthetic-predictor/raw/main/"
-            f"sa_0_4_{clip_model_short}_linear.pth"
-        )
-        print(f"Downloading LAION aesthetic head to {path_to_model} ...")
-        urlretrieve(url_model, path_to_model)
-
-    if clip_model_short == "vit_l_14":
-        head = torch.nn.Linear(768, 1)
-    elif clip_model_short == "vit_b_32":
-        head = torch.nn.Linear(512, 1)
-    else:
-        raise ValueError(f"Unsupported clip_model_short: {clip_model_short}")
-
-    state = torch.load(path_to_model, map_location="cpu")
-    head.load_state_dict(state)
-    head.eval()
-    return head
-
-
-def _ensure_aesthetic_models_loaded() -> None:
-    global _CLIP_MODEL, _CLIP_PREPROCESS, _AESTHETIC_HEAD, _AESTHETIC_DEVICE
-    if _CLIP_MODEL is not None and _AESTHETIC_HEAD is not None:
-        return
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Loading CLIP ViT-L/14 on {device} for aesthetic scoring...")
-    clip_model, preprocess = clip.load("ViT-L/14", device=device)  # type: ignore
-    aesthetic_head = _get_laion_aesthetic_head("vit_l_14").to(device)
-
-    _CLIP_MODEL = clip_model
-    _CLIP_PREPROCESS = preprocess
-    _AESTHETIC_HEAD = aesthetic_head
-    _AESTHETIC_DEVICE = device
-
-
-def compute_aesthetic_score(frame_bgr: np.ndarray) -> float:
-    """
-    Compute an aesthetic score (roughly 0–10) using CLIP embeddings
-    and the LAION aesthetic predictor.
-    """
-    _ensure_aesthetic_models_loaded()
-    assert _CLIP_MODEL is not None and _CLIP_PREPROCESS is not None
-    assert _AESTHETIC_HEAD is not None and _AESTHETIC_DEVICE is not None
-
-    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    pil_img = Image.fromarray(rgb)
-
-    with torch.no_grad():
-        image_input = _CLIP_PREPROCESS(pil_img).unsqueeze(0).to(_AESTHETIC_DEVICE)
-        image_features = _CLIP_MODEL.encode_image(image_input)
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        score = _AESTHETIC_HEAD(image_features).squeeze().cpu().item()
-
-    return float(score)
-
-
-# ============================================================
-# Technical Quality Assessment
-# ============================================================
-
-
-def compute_technical_quality(frame_bgr: np.ndarray) -> dict:
-    """Compute technical metrics and an overall technical quality score."""
-    h, w = frame_bgr.shape[:2]
-    total_pixels = int(h * w)
-
-    # Sharpness (variance of Laplacian)
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    sharpness_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-
-    # Prepare RGB float image
-    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    rgb_f = rgb.astype(np.float32) / 255.0
-
-    # Noise estimation (per channel, mean)
-    try:
-        sigma = restoration.estimate_sigma(rgb_f, channel_axis=-1)
-        noise_sigma = float(np.mean(sigma))
-    except Exception:
-        noise_sigma = 0.0
-
-    # Exposure histogram & clipping
-    gray_f = gray.astype(np.float32) / 255.0
-    try:
-        hist, _ = exposure.histogram(gray_f, nbins=256)
-        total = float(hist.sum()) or 1.0
-        clip_pct_shadows = float(hist[0:2].sum() / total)
-        clip_pct_highlights = float(hist[-2:].sum() / total)
-    except Exception:
-        clip_pct_shadows = 0.0
-        clip_pct_highlights = 0.0
-    mean_luma = float(gray_f.mean()) if gray_f.size else 0.0
-
-    # Color cast using LAB mean a/b magnitude
-    try:
-        lab = color.rgb2lab(rgb_f)
-        mean_a = float(np.mean(lab[..., 1]))
-        mean_b = float(np.mean(lab[..., 2]))
-        color_cast_score = float(np.sqrt(mean_a ** 2 + mean_b ** 2))
-    except Exception:
-        color_cast_score = 0.0
-
-    # Component scores (normalized 0-1)
-    min_sharpness_var = 100.0
-    max_noise_sigma = 0.08
-    max_clip_pct = 0.01
-    max_color_cast_score = 10.0
-
-    sharp_score = float(min(1.0, sharpness_var / min_sharpness_var))
-    noise_score = float(1.0 - min(1.0, noise_sigma / max_noise_sigma))
-    clip_score_sh = float(1.0 - min(1.0, clip_pct_shadows / max_clip_pct))
-    clip_score_hi = float(1.0 - min(1.0, clip_pct_highlights / max_clip_pct))
-
-    if mean_luma < 0.2:
-        exp_score = mean_luma / 0.2
-    elif mean_luma > 0.8:
-        exp_score = (1.0 - mean_luma) / 0.2
-    else:
-        exp_score = 1.0
-    exp_score = float(np.clip(exp_score, 0.0, 1.0))
-
-    color_score = float(1.0 - min(1.0, color_cast_score / max_color_cast_score))
-
-    tech_score = 100.0 * float(np.mean([
-        sharp_score,
-        noise_score,
-        clip_score_sh,
-        clip_score_hi,
-        exp_score,
-        color_score,
-    ]))
-
-    return {
-        "sharpness_var": sharpness_var,
-        "noise_sigma": noise_sigma,
-        "clip_pct_shadows": clip_pct_shadows,
-        "clip_pct_highlights": clip_pct_highlights,
-        "mean_luma": mean_luma,
-        "color_cast_score": color_cast_score,
-        "resolution_w": int(w),
-        "resolution_h": int(h),
-        "total_pixels": total_pixels,
-        "tech_score": tech_score,
     }
 
 
@@ -877,7 +642,6 @@ def process_video(
     min_aesthetic: float = 0.0,
     dedup_threshold: float = 0.15,
     progress_only: bool = False,
-    min_tech_score: float = MIN_TECH_SCORE,
 ) -> None:
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video not found: {video_path}")
@@ -1130,17 +894,17 @@ def process_video(
                 print("  -> skipped: heavy clipping")
             continue
 
-        if tech["tech_score"] < min_tech_score:
+        if tech["tech_score"] < MIN_TECH_SCORE:
             save_filtered_frame(
                 frame_bgr,
                 "low_tech_score",
                 {
                     "tech_score": tech["tech_score"],
-                    "threshold": min_tech_score,
+                    "threshold": MIN_TECH_SCORE,
                 },
             )
             if not progress_only:
-                print(f"  -> skipped: tech_score={tech['tech_score']:.1f} < {min_tech_score}")
+                print(f"  -> skipped: tech_score={tech['tech_score']:.1f} < {MIN_TECH_SCORE}")
             continue
 
         comp = compute_composition_features(frame_bgr, face_info=face)
@@ -1318,12 +1082,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Suppress per-frame logs and show a compact progress meter",
     )
-    parser.add_argument(
-        "--min-tech-score",
-        type=float,
-        default=MIN_TECH_SCORE,
-        help=f"Discard frames whose technical score is below this threshold (default: {MIN_TECH_SCORE})",
-    )
     return parser.parse_args()
 
 
@@ -1339,5 +1097,4 @@ if __name__ == "__main__":
         min_aesthetic=getattr(args, "min_aesthetic", 0.0),
         dedup_threshold=getattr(args, "dedup_threshold", 0.15),
         progress_only=getattr(args, "progress_only", False),
-        min_tech_score=getattr(args, "min_tech_score", MIN_TECH_SCORE),
     )

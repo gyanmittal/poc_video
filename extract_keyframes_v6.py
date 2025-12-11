@@ -708,10 +708,11 @@ def compute_technical_quality(frame_bgr: np.ndarray) -> dict:
 
 def extract_frames(
     video_path: str,
+    frame_stride_sec: float,
     max_seconds: float | None = None,
 ) -> Tuple[Iterable[Tuple[int, float, np.ndarray]], int, float]:
     """
-    Stream all frames from a video, yielding (frame_idx, timestamp_sec, frame_bgr).
+    Stream frames sampled by stride: yields (frame_idx, timestamp_sec, frame_bgr).
     Returns (iterator, total_frame_count, fps).
     """
     cap = cv2.VideoCapture(video_path)
@@ -720,23 +721,23 @@ def extract_frames(
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     if fps <= 0:
-        fps = 25.0  # fallback
+        fps = 25.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    stride_frames = max(1, int(round(frame_stride_sec * fps)))
 
     def _frame_iter() -> Iterable[Tuple[int, float, np.ndarray]]:
         frame_idx = 0
         try:
-            while True:
+            while frame_idx < total_frames:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
                 ret, frame = cap.read()
                 if not ret:
                     break
-
                 timestamp_sec = frame_idx / fps
                 if max_seconds is not None and timestamp_sec >= float(max_seconds):
                     break
-
                 yield frame_idx, timestamp_sec, frame.copy()
-                frame_idx += 1
+                frame_idx += stride_frames
         finally:
             cap.release()
 
@@ -877,7 +878,6 @@ def process_video(
     min_aesthetic: float = 0.0,
     dedup_threshold: float = 0.15,
     progress_only: bool = False,
-    min_tech_score: float = MIN_TECH_SCORE,
 ) -> None:
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video not found: {video_path}")
@@ -908,12 +908,13 @@ def process_video(
         print(
             f"Extracting frames from {video_path} (stride {frame_stride_sec}s, max_seconds={max_seconds})..."
         )
-    frame_iter, total_frames_est, video_fps = extract_frames(video_path, max_seconds)
-    est_frame_cap = total_frames_est
+    frame_iter, total_frames_est, video_fps = extract_frames(video_path, frame_stride_sec, max_seconds)
+    stride_frames = max(1, int(round(frame_stride_sec * video_fps)))
+    est_frame_cap = (total_frames_est // stride_frames) + 1
     if max_seconds is not None:
         est_frame_cap = min(
-            total_frames_est,
-            int(max_seconds * max(video_fps, 1e-6)),
+            est_frame_cap,
+            int((max_seconds * max(video_fps, 1e-6)) // stride_frames) + 1,
         )
     if not progress_only:
         print(f"Streaming frames (est. {est_frame_cap} frames within limit)")
@@ -947,41 +948,6 @@ def process_video(
             image_path = ""
 
     stride_sec = max(frame_stride_sec, 1e-6)
-    current_window_idx: Optional[int] = None
-    current_window_best: Optional[dict] = None
-    stop_processing = False
-
-    def flush_window_best() -> None:
-        nonlocal current_window_best
-        if current_window_best is None:
-            return
-        best_frame_idx = current_window_best["frame_idx"]
-        best_ts = current_window_best["timestamp"]
-        frame_img = current_window_best["frame_img"]
-        emb = compute_embedding(frame_img)
-        tmp_fname = f"{best_frame_idx:09d}_t{best_ts:.2f}.jpg"
-        tmp_path = os.path.join(tmp_candidate_dir, tmp_fname)
-        try:
-            ok = cv2.imwrite(tmp_path, frame_img, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-            if not ok:
-                tmp_path = ""
-        except Exception:
-            tmp_path = ""
-        stored_image = None if tmp_path else frame_img
-        candidates.append(
-            (
-                best_frame_idx,
-                best_ts,
-                current_window_best["aesthetic"],
-                emb,
-                tmp_path,
-                stored_image,
-                current_window_best["tech"],
-                current_window_best["face"],
-                current_window_best["comp"],
-            )
-        )
-        current_window_best = None
 
     for i, (frame_idx, ts, frame_bgr) in enumerate(frame_iter, start=1):
         if not progress_only:
@@ -1002,16 +968,6 @@ def process_video(
 
         if max_seconds is not None and ts >= max_seconds:
             break
-
-        window_idx = int(ts // stride_sec)
-        if current_window_idx is None:
-            current_window_idx = window_idx
-        elif window_idx != current_window_idx:
-            flush_window_best()
-            if max_frames is not None and len(candidates) >= max_frames:
-                stop_processing = True
-                break
-            current_window_idx = window_idx
 
         tech = compute_technical_quality(frame_bgr)
 
@@ -1130,17 +1086,17 @@ def process_video(
                 print("  -> skipped: heavy clipping")
             continue
 
-        if tech["tech_score"] < min_tech_score:
+        if tech["tech_score"] < MIN_TECH_SCORE:
             save_filtered_frame(
                 frame_bgr,
                 "low_tech_score",
                 {
                     "tech_score": tech["tech_score"],
-                    "threshold": min_tech_score,
+                    "threshold": MIN_TECH_SCORE,
                 },
             )
             if not progress_only:
-                print(f"  -> skipped: tech_score={tech['tech_score']:.1f} < {min_tech_score}")
+                print(f"  -> skipped: tech_score={tech['tech_score']:.1f} < {MIN_TECH_SCORE}")
             continue
 
         comp = compute_composition_features(frame_bgr, face_info=face)
@@ -1161,22 +1117,24 @@ def process_video(
             )
             continue
 
-        if (
-            current_window_best is None
-            or float(aest) > float(current_window_best["aesthetic"])
-        ):
-            current_window_best = {
-                "frame_idx": frame_idx,
-                "timestamp": ts,
-                "aesthetic": float(aest),
-                "frame_img": frame_bgr.copy(),
-                "tech": tech,
-                "face": face,
-                "comp": comp,
-            }
+        emb = compute_embedding(frame_bgr)
 
-    if not stop_processing:
-        flush_window_best()
+        tmp_fname = f"{frame_idx:09d}_t{ts:.2f}.jpg"
+        tmp_path = os.path.join(tmp_candidate_dir, tmp_fname)
+        stored_image: Optional[np.ndarray] = None
+        try:
+            ok = cv2.imwrite(tmp_path, frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            if not ok:
+                tmp_path = ""
+        except Exception:
+            tmp_path = ""
+        if not tmp_path:
+            stored_image = frame_bgr.copy()
+
+        candidates.append((frame_idx, ts, float(aest), emb, tmp_path, stored_image, tech, face, comp))
+
+        if max_frames is not None and len(candidates) >= max_frames:
+            break
 
     if hasattr(frame_iter, "close"):
         try:
@@ -1318,12 +1276,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Suppress per-frame logs and show a compact progress meter",
     )
-    parser.add_argument(
-        "--min-tech-score",
-        type=float,
-        default=MIN_TECH_SCORE,
-        help=f"Discard frames whose technical score is below this threshold (default: {MIN_TECH_SCORE})",
-    )
     return parser.parse_args()
 
 
@@ -1339,5 +1291,4 @@ if __name__ == "__main__":
         min_aesthetic=getattr(args, "min_aesthetic", 0.0),
         dedup_threshold=getattr(args, "dedup_threshold", 0.15),
         progress_only=getattr(args, "progress_only", False),
-        min_tech_score=getattr(args, "min_tech_score", MIN_TECH_SCORE),
     )

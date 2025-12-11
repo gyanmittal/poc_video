@@ -3,6 +3,7 @@ import argparse
 import os
 import shutil
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterable, List, Tuple, Optional
 
 import cv2
@@ -39,6 +40,18 @@ _AESTHETIC_HEAD = None
 _AESTHETIC_DEVICE = None
 
 _FACE_ANALYZER: Optional[FaceAnalysis] = None
+
+VIDEO_EXTENSIONS = (
+    ".mp4",
+    ".mov",
+    ".mkv",
+    ".avi",
+    ".flv",
+    ".webm",
+    ".m4v",
+    ".mpg",
+    ".mpeg",
+)
 
 
 # ============================================================
@@ -246,6 +259,16 @@ def compute_technical_quality(frame_bgr: np.ndarray) -> dict:
         "total_pixels": total_pixels,
         "tech_score": tech_score,
     }
+
+
+def is_black_slate(gray: np.ndarray, mean_luma: float, threshold_ratio: float, min_ratio: float) -> bool:
+    if gray.size == 0:
+        return False
+    non_black_ratio = float((gray > threshold_ratio).mean())
+    max_luma = float(gray.max())
+    return (non_black_ratio < min_ratio and mean_luma < threshold_ratio) or (
+        mean_luma < 0.05 and (max_luma - mean_luma) > 0.5
+    )
 
 
 # ============================================================
@@ -708,10 +731,11 @@ def compute_technical_quality(frame_bgr: np.ndarray) -> dict:
 
 def extract_frames(
     video_path: str,
+    frame_stride_sec: float,
     max_seconds: float | None = None,
 ) -> Tuple[Iterable[Tuple[int, float, np.ndarray]], int, float]:
     """
-    Stream all frames from a video, yielding (frame_idx, timestamp_sec, frame_bgr).
+    Stream frames sampled by stride: yields (frame_idx, timestamp_sec, frame_bgr).
     Returns (iterator, total_frame_count, fps).
     """
     cap = cv2.VideoCapture(video_path)
@@ -720,23 +744,23 @@ def extract_frames(
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     if fps <= 0:
-        fps = 25.0  # fallback
+        fps = 25.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    stride_frames = max(1, int(round(frame_stride_sec * fps)))
 
     def _frame_iter() -> Iterable[Tuple[int, float, np.ndarray]]:
         frame_idx = 0
         try:
-            while True:
+            while frame_idx < total_frames:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
                 ret, frame = cap.read()
                 if not ret:
                     break
-
                 timestamp_sec = frame_idx / fps
                 if max_seconds is not None and timestamp_sec >= float(max_seconds):
                     break
-
                 yield frame_idx, timestamp_sec, frame.copy()
-                frame_idx += 1
+                frame_idx += stride_frames
         finally:
             cap.release()
 
@@ -877,8 +901,15 @@ def process_video(
     min_aesthetic: float = 0.0,
     dedup_threshold: float = 0.15,
     progress_only: bool = False,
+    enable_face_checks: bool = True,
+    adaptive_stride: bool = False,
+    face_skin_threshold: float = 0.05,
+    max_workers: int = 4,
+    black_frame_threshold: float = 0.05,
+    black_frame_ratio: float = 0.05,
     min_tech_score: float = MIN_TECH_SCORE,
 ) -> None:
+    overall_start = time.time()
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video not found: {video_path}")
 
@@ -908,12 +939,13 @@ def process_video(
         print(
             f"Extracting frames from {video_path} (stride {frame_stride_sec}s, max_seconds={max_seconds})..."
         )
-    frame_iter, total_frames_est, video_fps = extract_frames(video_path, max_seconds)
-    est_frame_cap = total_frames_est
+    frame_iter, total_frames_est, video_fps = extract_frames(video_path, frame_stride_sec, max_seconds)
+    stride_frames = max(1, int(round(frame_stride_sec * video_fps)))
+    est_frame_cap = (total_frames_est // stride_frames) + 1
     if max_seconds is not None:
         est_frame_cap = min(
-            total_frames_est,
-            int(max_seconds * max(video_fps, 1e-6)),
+            est_frame_cap,
+            int((max_seconds * max(video_fps, 1e-6)) // stride_frames) + 1,
         )
     if not progress_only:
         print(f"Streaming frames (est. {est_frame_cap} frames within limit)")
@@ -947,41 +979,76 @@ def process_video(
             image_path = ""
 
     stride_sec = max(frame_stride_sec, 1e-6)
-    current_window_idx: Optional[int] = None
-    current_window_best: Optional[dict] = None
-    stop_processing = False
 
-    def flush_window_best() -> None:
-        nonlocal current_window_best
-        if current_window_best is None:
-            return
-        best_frame_idx = current_window_best["frame_idx"]
-        best_ts = current_window_best["timestamp"]
-        frame_img = current_window_best["frame_img"]
-        emb = compute_embedding(frame_img)
-        tmp_fname = f"{best_frame_idx:09d}_t{best_ts:.2f}.jpg"
+    def skin_probability(frame: np.ndarray) -> float:
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, (0, 48, 80), (20, 255, 255))
+        return float(mask.mean() / 255.0)
+
+    def should_run_face(frame: np.ndarray) -> bool:
+        if not enable_face_checks or FaceAnalysis is None:
+            return False
+        return skin_probability(frame) >= face_skin_threshold
+
+    def process_frame(frame_idx: int, ts: float, frame_bgr: np.ndarray) -> Optional[tuple]:
+        tech = compute_technical_quality(frame_bgr)
+        long_edge = max(tech["resolution_w"], tech["resolution_h"])
+        if long_edge < MIN_RES_LONG_EDGE or tech["total_pixels"] < MIN_TOTAL_PIXELS:
+            return None
+
+        if tech["tech_score"] < min_tech_score:
+            return None
+
+        if is_black_slate(
+            cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0,
+            tech["mean_luma"],
+            black_frame_threshold,
+            black_frame_ratio,
+        ):
+            return None
+
+        run_face = should_run_face(frame_bgr)
+        if run_face:
+            face = compute_face_features(frame_bgr)
+        else:
+            face = {
+                "num_faces": 0,
+                "has_face": False,
+                "main_face_bbox": None,
+                "face_sharpness_var": 0.0,
+                "face_quality_score": 0.0,
+                "main_face_rel_area": 0.0,
+            }
+
+        if tech["sharpness_var"] < MIN_SHARPNESS_VAR and run_face:
+            face_sharpness = face.get("face_sharpness_var", 0.0)
+            if not (face.get("has_face", False) and face_sharpness >= (0.5 * MIN_SHARPNESS_VAR)):
+                return None
+
+        comp = compute_composition_features(frame_bgr, face_info=face)
+        aest = compute_aesthetic_score(frame_bgr)
+        if aest < float(min_aesthetic):
+            return None
+        emb = compute_embedding(frame_bgr)
+
+        tmp_fname = f"{frame_idx:09d}_t{ts:.2f}.jpg"
         tmp_path = os.path.join(tmp_candidate_dir, tmp_fname)
+        stored_image: Optional[np.ndarray] = None
         try:
-            ok = cv2.imwrite(tmp_path, frame_img, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            ok = cv2.imwrite(tmp_path, frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
             if not ok:
                 tmp_path = ""
         except Exception:
             tmp_path = ""
-        stored_image = None if tmp_path else frame_img
-        candidates.append(
-            (
-                best_frame_idx,
-                best_ts,
-                current_window_best["aesthetic"],
-                emb,
-                tmp_path,
-                stored_image,
-                current_window_best["tech"],
-                current_window_best["face"],
-                current_window_best["comp"],
-            )
-        )
-        current_window_best = None
+        if not tmp_path:
+            stored_image = frame_bgr.copy()
+
+        return (frame_idx, ts, float(aest), emb, tmp_path, stored_image, tech, face, comp)
+
+    workers = max(1, max_workers)
+    executor = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+    futures = []
+    prev_frame = None
 
     for i, (frame_idx, ts, frame_bgr) in enumerate(frame_iter, start=1):
         if not progress_only:
@@ -1003,180 +1070,44 @@ def process_video(
         if max_seconds is not None and ts >= max_seconds:
             break
 
-        window_idx = int(ts // stride_sec)
-        if current_window_idx is None:
-            current_window_idx = window_idx
-        elif window_idx != current_window_idx:
-            flush_window_best()
-            if max_frames is not None and len(candidates) >= max_frames:
-                stop_processing = True
-                break
-            current_window_idx = window_idx
-
-        tech = compute_technical_quality(frame_bgr)
-
-        long_edge = max(tech["resolution_w"], tech["resolution_h"])
-        if long_edge < MIN_RES_LONG_EDGE or tech["total_pixels"] < MIN_TOTAL_PIXELS:
-            save_filtered_frame(
-                frame_bgr,
-                "low_resolution",
-                {
-                    "resolution_w": tech["resolution_w"],
-                    "resolution_h": tech["resolution_h"],
-                    "total_pixels": tech["total_pixels"],
-                    "min_res_long_edge": MIN_RES_LONG_EDGE,
-                    "min_total_pixels": MIN_TOTAL_PIXELS,
-                },
-            )
-            if not progress_only:
-                print("  -> skipped: resolution too low")
-            continue
-
-        if tech["sharpness_var"] < MIN_SHARPNESS_VAR:
-            face = compute_face_features(frame_bgr)
-            face_sharpness = face.get("face_sharpness_var", 0.0)
-            face_ok = face.get("has_face", False) and face_sharpness >= (0.5 * MIN_SHARPNESS_VAR)
-            if not face_ok:
-                save_filtered_frame(
-                    frame_bgr,
-                    "too_blurry",
-                    {
-                        "frame_sharpness_var": tech["sharpness_var"],
-                        "face_sharpness_var": face_sharpness,
-                        "min_sharpness_var": MIN_SHARPNESS_VAR,
-                        "has_face": face.get("has_face", False),
-                    },
-                )
-                if not progress_only:
-                    print("  -> skipped: too blurry")
+        if adaptive_stride and prev_frame is not None:
+            diff = cv2.absdiff(prev_frame, frame_bgr)
+            if diff.mean() < 3.0:
+                prev_frame = frame_bgr
                 continue
+        prev_frame = frame_bgr
+
+        if executor:
+            futures.append(executor.submit(process_frame, frame_idx, ts, frame_bgr.copy()))
         else:
-            face = compute_face_features(frame_bgr)
+            result = process_frame(frame_idx, ts, frame_bgr)
+            if result:
+                candidates.append(result)
+                if max_frames is not None and len(candidates) >= max_frames:
+                    break
 
-        frame_h, frame_w = frame_bgr.shape[:2]
-
-        if face.get("has_face", False) and face.get("main_face_bbox"):
-            x_min, y_min, x_max, y_max = face["main_face_bbox"]
-            face_w = max(0, x_max - x_min)
-            face_h = max(0, y_max - y_min)
-            min_dim = min(face_w, face_h)
-            shortest_edge = max(1, min(frame_w, frame_h))
-            min_dim_ratio = float(min_dim) / float(shortest_edge)
-            if min_dim_ratio < MIN_FACE_MIN_DIM_RATIO:
-                save_filtered_frame(
-                    frame_bgr,
-                    "face_too_small",
-                    {
-                        "min_dim_ratio": min_dim_ratio,
-                        "threshold": MIN_FACE_MIN_DIM_RATIO,
-                        "face_width": face_w,
-                        "face_height": face_h,
-                    },
-                )
-                if not progress_only:
+    if executor:
+        total_jobs = len(futures)
+        completed_jobs = 0
+        log_every = max(1, total_jobs // 100)
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                candidates.append(result)
+                if max_frames is not None and len(candidates) >= max_frames:
+                    break
+            completed_jobs += 1
+            if progress_only and (completed_jobs == total_jobs or completed_jobs % log_every == 0):
+                pct = (completed_jobs / max(1, total_jobs)) * 100.0
+                try:
                     print(
-                        "  -> skipped: face too small "
-                        f"(min_dim_ratio={min_dim_ratio:.3f})"
+                        f"\r[prog] filtering {completed_jobs}/{total_jobs} ({pct:.1f}%)",
+                        end="" if completed_jobs < total_jobs else "\n",
+                        flush=True,
                     )
-                continue
-
-            aspect = face_w / float(max(1, face_h)) if face_h > 0 else 0.0
-            if aspect < FACE_ASPECT_MIN or aspect > FACE_ASPECT_MAX:
-                save_filtered_frame(
-                    frame_bgr,
-                    "face_aspect_weird",
-                    {
-                        "aspect_ratio": aspect,
-                        "min_allowed": FACE_ASPECT_MIN,
-                        "max_allowed": FACE_ASPECT_MAX,
-                        "face_width": face_w,
-                        "face_height": face_h,
-                    },
-                )
-                if not progress_only:
-                    print(
-                        "  -> skipped: face aspect ratio out of range "
-                        f"({aspect:.2f})"
-                    )
-                continue
-
-        if tech["noise_sigma"] > MAX_NOISE_SIGMA:
-            save_filtered_frame(
-                frame_bgr,
-                "too_noisy",
-                {
-                    "noise_sigma": tech["noise_sigma"],
-                    "max_noise_sigma": MAX_NOISE_SIGMA,
-                },
-            )
-            if not progress_only:
-                print("  -> skipped: too noisy")
-            continue
-
-        if (
-            tech["clip_pct_shadows"] > MAX_CLIP_PCT
-            or tech["clip_pct_highlights"] > MAX_CLIP_PCT
-        ):
-            save_filtered_frame(
-                frame_bgr,
-                "heavy_clipping",
-                {
-                    "clip_pct_shadows": tech["clip_pct_shadows"],
-                    "clip_pct_highlights": tech["clip_pct_highlights"],
-                    "max_clip_pct": MAX_CLIP_PCT,
-                },
-            )
-            if not progress_only:
-                print("  -> skipped: heavy clipping")
-            continue
-
-        if tech["tech_score"] < min_tech_score:
-            save_filtered_frame(
-                frame_bgr,
-                "low_tech_score",
-                {
-                    "tech_score": tech["tech_score"],
-                    "threshold": min_tech_score,
-                },
-            )
-            if not progress_only:
-                print(f"  -> skipped: tech_score={tech['tech_score']:.1f} < {min_tech_score}")
-            continue
-
-        comp = compute_composition_features(frame_bgr, face_info=face)
-
-        # Aesthetic score
-        aest = compute_aesthetic_score(frame_bgr)
-
-        if aest < float(min_aesthetic):
-            save_filtered_frame(
-                frame_bgr,
-                "low_aesthetic",
-                {
-                    "aesthetic": float(aest),
-                    "min_aesthetic": float(min_aesthetic),
-                    "num_faces": face.get("num_faces", 0),
-                    "has_face": face.get("has_face", False),
-                },
-            )
-            continue
-
-        if (
-            current_window_best is None
-            or float(aest) > float(current_window_best["aesthetic"])
-        ):
-            current_window_best = {
-                "frame_idx": frame_idx,
-                "timestamp": ts,
-                "aesthetic": float(aest),
-                "frame_img": frame_bgr.copy(),
-                "tech": tech,
-                "face": face,
-                "comp": comp,
-            }
-
-    if not stop_processing:
-        flush_window_best()
+                except Exception:
+                    pass
+        executor.shutdown(wait=True)
 
     if hasattr(frame_iter, "close"):
         try:
@@ -1192,40 +1123,62 @@ def process_video(
     ] = []
     kept_embs: List[np.ndarray] = []
     effective_threshold = max(0.0, float(dedup_threshold))
+    # Vectorized store of kept embeddings for fast similarity checks
+    kept_mat: Optional[np.ndarray] = None
 
-    for cand in candidates:
+    total_candidates = max(1, len(candidates))
+    dedup_log_every = max(1, total_candidates // 100)
+    for idx, cand in enumerate(candidates, start=1):
         frame_idx, ts, aest, emb, tmp_path, stored_image, tech, face, comp = cand
-        if effective_threshold <= 0.0 or len(kept_embs) == 0:
+        # If dedup disabled or nothing kept yet, accept immediately
+        if effective_threshold <= 0.0 or kept_mat is None or kept_mat.size == 0:
             kept.append(cand)
-            kept_embs.append(emb)
+            if kept_mat is None:
+                kept_mat = emb.reshape(1, -1).astype(np.float32, copy=False)
+            else:
+                kept_mat = np.vstack([kept_mat, emb])
             continue
 
-        # cosine distance to existing kept embeddings
-        dists = [1.0 - float(np.dot(k_emb, emb)) for k_emb in kept_embs]
-        min_dist = min(dists) if dists else 1.0
+        # Vectorized cosine similarity (embeddings are L2-normalized)
+        try:
+            sims = kept_mat.dot(emb)  # shape (K,)
+            max_sim = float(np.max(sims)) if sims.size else -1.0
+        except Exception:
+            # Fallback to scalar loop in rare failure cases
+            sims = [float(np.dot(k, emb)) for k in kept_mat]  # type: ignore[arg-type]
+            max_sim = max(sims) if sims else -1.0
+        min_dist = 1.0 - max_sim
         if min_dist < effective_threshold:
-            # duplicate detected, skip (keep higher-aesthetic already stored)
+            # duplicate detected, skip (higher-aesthetic already kept)
             continue
 
         kept.append(cand)
-        kept_embs.append(emb)
+        kept_mat = np.vstack([kept_mat, emb])
+
+        if progress_only and (idx == total_candidates or idx % dedup_log_every == 0):
+            pct = (idx / max(1, total_candidates)) * 100.0
+            try:
+                print(
+                    f"\r[prog] dedup {idx}/{total_candidates} ({pct:.1f}%)",
+                    end="" if idx < total_candidates else "\n",
+                    flush=True,
+                )
+            except Exception:
+                pass
 
     # Persist kept frames in timestamp order for readability
     kept.sort(key=lambda x: x[1])
 
+    total_kept = len(kept)
+    progress_step = max(1, total_kept // 25)
+
+    # Batch DB writes in a single transaction for speed
+    try:
+        conn.execute("BEGIN TRANSACTION;")
+    except Exception:
+        pass
+
     for rank, (frame_idx, ts, aest, emb, tmp_path, stored_image, tech, face, comp) in enumerate(kept, start=1):
-        frame_img: Optional[np.ndarray] = None
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                frame_img = cv2.imread(tmp_path)
-            except Exception:
-                frame_img = None
-        if frame_img is None and stored_image is not None:
-            frame_img = stored_image
-
-        if frame_img is None:
-            continue
-
         insert_frame_row(
             conn=conn,
             video_path=video_path,
@@ -1249,11 +1202,45 @@ def process_video(
             embedding=emb,
         )
 
-        try:
-            fname = f"{frame_idx:09d}_t{ts:.2f}_aest{aest:.2f}.jpg"
-            cv2.imwrite(os.path.join(video_out_dir, fname), frame_img, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-        except Exception:
-            pass
+        # Move tmp JPEG into final location when available, avoiding re-encode
+        fname = f"{frame_idx:09d}_t{ts:.2f}_aest{aest:.2f}.jpg"
+        dest_path = os.path.join(video_out_dir, fname)
+        moved = False
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.replace(tmp_path, dest_path)
+                moved = True
+            except Exception:
+                moved = False
+        if not moved:
+            if stored_image is not None:
+                try:
+                    cv2.imwrite(dest_path, stored_image, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+                except Exception:
+                    pass
+            elif tmp_path and os.path.exists(tmp_path):
+                try:
+                    img = cv2.imread(tmp_path)
+                    if img is not None:
+                        cv2.imwrite(dest_path, img, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+                except Exception:
+                    pass
+
+        if progress_only and (rank == 1 or rank == total_kept or rank % progress_step == 0):
+            pct = (rank / max(1, total_kept)) * 100.0
+            try:
+                print(
+                    f"\r[prog] writing kept frames {rank}/{total_kept} ({pct:.1f}%)",
+                    end="" if rank < total_kept else "\n",
+                    flush=True,
+                )
+            except Exception:
+                pass
+
+    try:
+        conn.execute("COMMIT;")
+    except Exception:
+        pass
 
     if progress_only:
         try:
@@ -1263,14 +1250,31 @@ def process_video(
 
     shutil.rmtree(tmp_candidate_dir, ignore_errors=True)
     conn.close()
-    print(f"Done. kept={len(kept)} (from {len(candidates)} candidates after filtering)")
+    total_time = time.time() - overall_start
+    print(
+        f"Done. kept={len(kept)} (from {len(candidates)} candidates after filtering). Total time: {total_time:.1f}s"
+    )
+
+
+def collect_video_inputs(input_path: str) -> List[str]:
+    if os.path.isfile(input_path):
+        return [input_path]
+    if os.path.isdir(input_path):
+        collected: List[str] = []
+        for root, _, files in os.walk(input_path):
+            for fname in files:
+                if fname.lower().endswith(VIDEO_EXTENSIONS):
+                    collected.append(os.path.join(root, fname))
+        collected.sort()
+        return collected
+    raise FileNotFoundError(f"Input path not found: {input_path}")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Extract keyframes, compute embeddings and CLIP+LAION aesthetic scores, store in DuckDB."
     )
-    parser.add_argument("video", help="Path to input video file")
+    parser.add_argument("video", help="Path to input video file or directory of videos")
     parser.add_argument(
         "--db",
         default="frames.duckdb",
@@ -1322,22 +1326,63 @@ def parse_args() -> argparse.Namespace:
         "--min-tech-score",
         type=float,
         default=MIN_TECH_SCORE,
-        help=f"Discard frames whose technical score is below this threshold (default: {MIN_TECH_SCORE})",
+        help=f"Discard frames with technical score below this threshold (default: {MIN_TECH_SCORE})",
     )
+    parser.add_argument("--disable-face", action="store_true", help="Skip InsightFace checks entirely")
+    parser.add_argument("--adaptive-stride", action="store_true", help="Skip stride frames with low motion")
+    parser.add_argument(
+        "--face-skin-threshold",
+        type=float,
+        default=0.05,
+        help="Minimum skin probability to run face detection when enabled",
+    )
+    parser.add_argument(
+        "--black-frame-threshold",
+        type=float,
+        default=0.05,
+        help="Minimum ratio of mid-tone pixels to accept (filters black slates)",
+    )
+    parser.add_argument(
+        "--black-frame-mean",
+        type=float,
+        default=0.05,
+        help="Skip frames whose mean luma is below this when paired with low mid-tone ratio",
+    )
+    parser.add_argument("--workers", type=int, default=4, help="Number of threads for preprocessing")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    process_video(
-        video_path=args.video,
-        db_path=args.db,
-        frame_stride_sec=args.stride_sec,
-        max_frames=args.max_frames,
-        output_dir=args.output,
-        max_seconds=getattr(args, "max_seconds", None),
-        min_aesthetic=getattr(args, "min_aesthetic", 0.0),
-        dedup_threshold=getattr(args, "dedup_threshold", 0.15),
-        progress_only=getattr(args, "progress_only", False),
-        min_tech_score=getattr(args, "min_tech_score", MIN_TECH_SCORE),
-    )
+
+    video_inputs = collect_video_inputs(args.video)
+    if not video_inputs:
+        raise FileNotFoundError(f"No video files found in directory: {args.video}")
+
+    total_videos = len(video_inputs)
+    for idx, video_path in enumerate(video_inputs, start=1):
+        if not args.progress_only:
+            prefix = f"[{idx}/{total_videos}] " if total_videos > 1 else ""
+            print(f"{prefix}Processing {video_path}")
+        elif total_videos > 1:
+            try:
+                print(f"[prog] video {idx}/{total_videos}: {video_path}")
+            except Exception:
+                pass
+
+        process_video(
+            video_path=video_path,
+            db_path=args.db,
+            frame_stride_sec=args.stride_sec,
+            max_frames=args.max_frames,
+            output_dir=args.output,
+            max_seconds=getattr(args, "max_seconds", None),
+            min_aesthetic=getattr(args, "min_aesthetic", 0.0),
+            dedup_threshold=getattr(args, "dedup_threshold", 0.15),
+            progress_only=getattr(args, "progress_only", False),
+            enable_face_checks=not getattr(args, "disable_face", False),
+            adaptive_stride=getattr(args, "adaptive_stride", False),
+            face_skin_threshold=getattr(args, "face_skin_threshold", 0.05),
+            max_workers=getattr(args, "workers", 4),
+            min_tech_score=getattr(args, "min_tech_score", MIN_TECH_SCORE),
+        )
