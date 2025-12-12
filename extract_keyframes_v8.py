@@ -743,6 +743,7 @@ def extract_frames(
     video_path: str,
     frame_stride_sec: float,
     max_seconds: float | None = None,
+    start_sec: float = 0.0,
 ) -> Tuple[Iterable[Tuple[int, float, np.ndarray]], int, float]:
     """
     Stream frames sampled by stride: yields (frame_idx, timestamp_sec, frame_bgr).
@@ -757,9 +758,11 @@ def extract_frames(
         fps = 25.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     stride_frames = max(1, int(round(frame_stride_sec * fps)))
+    start_sec = max(0.0, float(start_sec))
+    start_frame = int(min(total_frames, max(0, round(start_sec * fps))))
 
     def _frame_iter() -> Iterable[Tuple[int, float, np.ndarray]]:
-        frame_idx = 0
+        frame_idx = start_frame
         try:
             while frame_idx < total_frames:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
@@ -775,6 +778,18 @@ def extract_frames(
             cap.release()
 
     return _frame_iter(), total_frames, float(fps)
+
+
+def get_video_duration(video_path: str) -> float:
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return 0.0
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    cap.release()
+    if fps <= 0:
+        fps = 25.0
+    return float(total_frames) / max(fps, 1e-6)
 
 
 # ============================================================
@@ -910,6 +925,7 @@ def process_video(
     max_seconds: float | None = None,
     min_aesthetic: float = 0.0,
     dedup_threshold: float = 0.15,
+    final_dedup_threshold: float | None = None,
     progress_only: bool = False,
     enable_face_checks: bool = True,
     adaptive_stride: bool = False,
@@ -927,55 +943,91 @@ def process_video(
     overlay_hue_dominance: float = 0.7,
     overlay_color_ratio: float = 0.4,
     use_aesthetic: bool = True,
+    start_sec: float = 0.0,
+    resize_long_edge: int = 0,
+    skip_to_final_stage: bool = False,
 ) -> None:
     overall_start = time.time()
+    start_sec = max(0.0, float(start_sec))
+    first_chunk = start_sec <= 1e-6
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video not found: {video_path}")
 
     if not progress_only:
-        print(f"Opening DuckDB at {db_path}")
+        chunk_label = (
+            f"[chunk {start_sec:.1f}s - {max_seconds if max_seconds is not None else 'end'}s]"
+        )
+        print(f"Opening DuckDB at {db_path} {chunk_label}")
     conn = duckdb.connect(database=db_path)
     init_db(conn)
 
     # Prepare image output directory as <output>/<video_name>/
     video_name = os.path.splitext(os.path.basename(video_path))[0]
     video_out_dir = os.path.join(output_dir, video_name)
-    if os.path.exists(video_out_dir):
+    if first_chunk and os.path.exists(video_out_dir):
         shutil.rmtree(video_out_dir)
     os.makedirs(video_out_dir, exist_ok=True)
+
+    final_index_path = os.path.join(video_out_dir, "_final_embeddings.npy")
+    final_removed_dir = os.path.join(video_out_dir, "finally_removed")
+    if first_chunk:
+        shutil.rmtree(final_removed_dir, ignore_errors=True)
+        try:
+            os.remove(final_index_path)
+        except Exception:
+            pass
+    os.makedirs(final_removed_dir, exist_ok=True)
 
     filtered_dir = os.path.join(video_out_dir, "filtered")
     os.makedirs(filtered_dir, exist_ok=True)
 
-    tmp_candidate_dir = os.path.join(video_out_dir, "_candidates_tmp")
+    tmp_candidate_dir = os.path.join(
+        video_out_dir, f"_candidates_tmp_{int(round(start_sec * 1000.0))}"
+    )
     os.makedirs(tmp_candidate_dir, exist_ok=True)
 
-    clear_previous_video(conn, video_path)
+    if first_chunk:
+        clear_previous_video(conn, video_path)
 
     max_seconds = float(max_seconds) if max_seconds is not None else None
-
-    if not progress_only:
-        print(
-            f"Extracting frames from {video_path} (stride {frame_stride_sec}s, max_seconds={max_seconds})..."
-        )
-    frame_iter, total_frames_est, video_fps = extract_frames(video_path, frame_stride_sec, max_seconds)
-    stride_frames = max(1, int(round(frame_stride_sec * video_fps)))
-    est_frame_cap = (total_frames_est // stride_frames) + 1
-    if max_seconds is not None:
-        est_frame_cap = min(
-            est_frame_cap,
-            int((max_seconds * max(video_fps, 1e-6)) // stride_frames) + 1,
-        )
-    if not progress_only:
-        print(f"Streaming frames (est. {est_frame_cap} frames within limit)")
 
     candidates: List[
         Tuple[int, float, float, np.ndarray, Optional[str], Optional[np.ndarray], dict, dict, dict]
     ] = []
 
-    total_frames = max(1, est_frame_cap)
-    progress_log_interval = max(1, total_frames // 100)
+    total_frames = 1
+    progress_log_interval = 1
     start_time = time.time()
+    existing_final_mat: Optional[np.ndarray] = None
+    if os.path.exists(final_index_path):
+        try:
+            existing_final_mat = np.load(final_index_path)
+        except Exception:
+            existing_final_mat = None
+
+    if skip_to_final_stage:
+        frame_iter = []
+        est_frame_cap = 0
+        video_fps = 25.0
+    else:
+        if not progress_only:
+            print(
+                f"Extracting frames from {video_path} "
+                f"(stride {frame_stride_sec}s, chunk_start={start_sec}, max_seconds={max_seconds})..."
+            )
+        frame_iter, total_frames_est, video_fps = extract_frames(
+            video_path, frame_stride_sec, max_seconds, start_sec=start_sec
+        )
+        stride_frames = max(1, int(round(frame_stride_sec * video_fps)))
+        total_duration_sec = total_frames_est / max(video_fps, 1e-6)
+        chunk_end = max_seconds if max_seconds is not None else total_duration_sec
+        chunk_span = max(0.0, chunk_end - start_sec)
+        est_frame_cap = int((chunk_span * max(video_fps, 1e-6)) // stride_frames) + 1
+        if not progress_only:
+            print(f"Streaming frames (est. {est_frame_cap} frames within limit)")
+
+        total_frames = max(1, est_frame_cap)
+        progress_log_interval = max(1, total_frames // 100)
 
     def save_filtered_frame(frame_img: np.ndarray, reason: str, details: Optional[dict] = None) -> None:
         slug = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in reason.lower())
@@ -1070,25 +1122,46 @@ def process_video(
         return False
 
     def process_frame(frame_idx: int, ts: float, frame_bgr: np.ndarray) -> Optional[tuple]:
-        tech = compute_technical_quality(frame_bgr)
+        original_frame = frame_bgr
+        proc_frame = frame_bgr
+        quality_scale = 1.0
+        if resize_long_edge > 0:
+            h0, w0 = original_frame.shape[:2]
+            long_edge_src = max(h0, w0)
+            if long_edge_src > resize_long_edge:
+                scale = float(resize_long_edge) / float(long_edge_src)
+                new_w = max(1, int(round(w0 * scale)))
+                new_h = max(1, int(round(h0 * scale)))
+                try:
+                    proc_frame = cv2.resize(original_frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                except Exception:
+                    proc_frame = original_frame
+                quality_scale = scale
+            else:
+                quality_scale = 1.0
+        tech = compute_technical_quality(proc_frame)
         long_edge = max(tech["resolution_w"], tech["resolution_h"])
-        if long_edge < MIN_RES_LONG_EDGE or tech["total_pixels"] < MIN_TOTAL_PIXELS:
+        min_res_edge = MIN_RES_LONG_EDGE * quality_scale
+        min_total_pixels = MIN_TOTAL_PIXELS * (quality_scale ** 2)
+        min_res_edge = max(1.0, min_res_edge)
+        min_total_pixels = max(10.0, min_total_pixels)
+        if long_edge < min_res_edge or tech["total_pixels"] < min_total_pixels:
             return None
 
         if tech["tech_score"] < min_tech_score:
             return None
 
         if is_black_slate(
-            cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0,
+            cv2.cvtColor(proc_frame, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0,
             tech["mean_luma"],
             black_frame_threshold,
             black_frame_ratio,
         ):
             return None
 
-        run_face = should_run_face(frame_bgr)
+        run_face = should_run_face(proc_frame)
         if run_face:
-            face = compute_face_features(frame_bgr)
+            face = compute_face_features(proc_frame)
         else:
             face = {
                 "num_faces": 0,
@@ -1103,7 +1176,7 @@ def process_video(
             return None
 
         if skip_overlay_cards and looks_like_overlay_card(
-            frame_bgr,
+            proc_frame,
             coverage_ratio=overlay_coverage,
             sat_threshold=overlay_sat_threshold,
             sat_ratio_threshold=overlay_sat_ratio,
@@ -1118,70 +1191,74 @@ def process_video(
             if not (face.get("has_face", False) and face_sharpness >= (0.5 * MIN_SHARPNESS_VAR)):
                 return None
 
-        comp = compute_composition_features(frame_bgr, face_info=face)
+        comp = compute_composition_features(proc_frame, face_info=face)
         if use_aesthetic:
-            aest = compute_aesthetic_score(frame_bgr)
+            aest = compute_aesthetic_score(proc_frame)
             if aest < float(min_aesthetic):
                 return None
         else:
             aest = 0.0
-        emb = compute_embedding(frame_bgr)
+        emb = compute_embedding(proc_frame)
 
         tmp_fname = f"{frame_idx:09d}_t{ts:.2f}.jpg"
         tmp_path = os.path.join(tmp_candidate_dir, tmp_fname)
         stored_image: Optional[np.ndarray] = None
         try:
-            ok = cv2.imwrite(tmp_path, frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            ok = cv2.imwrite(tmp_path, original_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
             if not ok:
                 tmp_path = ""
         except Exception:
             tmp_path = ""
         if not tmp_path:
-            stored_image = frame_bgr.copy()
+            stored_image = original_frame.copy()
 
         return (frame_idx, ts, float(aest), emb, tmp_path, stored_image, tech, face, comp)
 
     workers = max(1, max_workers)
-    executor = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+    executor = ThreadPoolExecutor(max_workers=workers) if workers > 1 and not skip_to_final_stage else None
     futures = []
     prev_frame = None
 
-    for i, (frame_idx, ts, frame_bgr) in enumerate(frame_iter, start=1):
-        if not progress_only:
-            print(f"[{i}/{total_frames}] frame_index={frame_idx}, t={ts:.2f}s")
-        elif i == 1 or (i % progress_log_interval == 0) or i == total_frames:
-            pct = (float(i) / float(total_frames)) * 100.0
-            elapsed = time.time() - start_time
-            remaining = (elapsed / max(i, 1)) * (total_frames - i)
-            try:
-                print(
-                    f"\r[prog] frames {i}/{total_frames} ({pct:.1f}%) "
-                    f"elapsed={elapsed:.1f}s left={max(0.0, remaining):.1f}s",
-                    end="" if i < total_frames else "\n",
-                    flush=True,
-                )
-            except Exception:
-                pass
+    if not skip_to_final_stage:
+        for i, (frame_idx, ts, frame_bgr) in enumerate(frame_iter, start=1):
+            if not progress_only:
+                print(f"[{i}/{total_frames}] frame_index={frame_idx}, t={ts:.2f}s")
+            elif i == 1 or (i % progress_log_interval == 0) or i == total_frames:
+                pct = (float(i) / float(total_frames)) * 100.0
+                elapsed = time.time() - start_time
+                total_elapsed = time.time() - overall_start
+                remaining = (elapsed / max(i, 1)) * (total_frames - i)
+                try:
+                    print(
+                        f"\r[prog] frames {i}/{total_frames} ({pct:.1f}%) "
+                        f"elapsed={elapsed:.1f}s total={total_elapsed:.1f}s "
+                        f"left={max(0.0, remaining):.1f}s",
+                        end="" if i < total_frames else "\n",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
 
-        if max_seconds is not None and ts >= max_seconds:
-            break
+            if max_seconds is not None and ts >= max_seconds:
+                break
 
-        if adaptive_stride and prev_frame is not None:
-            diff = cv2.absdiff(prev_frame, frame_bgr)
-            if diff.mean() < 3.0:
-                prev_frame = frame_bgr
-                continue
-        prev_frame = frame_bgr
+            if adaptive_stride and prev_frame is not None:
+                diff = cv2.absdiff(prev_frame, frame_bgr)
+                if diff.mean() < 3.0:
+                    prev_frame = frame_bgr
+                    continue
+            prev_frame = frame_bgr
 
-        if executor:
-            futures.append(executor.submit(process_frame, frame_idx, ts, frame_bgr.copy()))
-        else:
-            result = process_frame(frame_idx, ts, frame_bgr)
-            if result:
-                candidates.append(result)
-                if max_frames is not None and len(candidates) >= max_frames:
-                    break
+            if executor:
+                futures.append(executor.submit(process_frame, frame_idx, ts, frame_bgr.copy()))
+            else:
+                result = process_frame(frame_idx, ts, frame_bgr)
+                if result:
+                    candidates.append(result)
+                    if max_frames is not None and len(candidates) >= max_frames:
+                        break
 
+    filter_stage_start = time.time()
     if executor:
         total_jobs = len(futures)
         completed_jobs = 0
@@ -1195,9 +1272,12 @@ def process_video(
             completed_jobs += 1
             if progress_only and (completed_jobs == total_jobs or completed_jobs % log_every == 0):
                 pct = (completed_jobs / max(1, total_jobs)) * 100.0
+                stage_elapsed = time.time() - filter_stage_start
+                total_elapsed = time.time() - overall_start
                 try:
                     print(
-                        f"\r[prog] filtering {completed_jobs}/{total_jobs} ({pct:.1f}%)",
+                        f"\r[prog] filtering {completed_jobs}/{total_jobs} ({pct:.1f}%) "
+                        f"elapsed={stage_elapsed:.1f}s total={total_elapsed:.1f}s",
                         end="" if completed_jobs < total_jobs else "\n",
                         flush=True,
                     )
@@ -1205,7 +1285,7 @@ def process_video(
                     pass
         executor.shutdown(wait=True)
 
-    if hasattr(frame_iter, "close"):
+    if hasattr(frame_iter, "close") and not skip_to_final_stage:
         try:
             frame_iter.close()  # type: ignore[attr-defined]
         except Exception:
@@ -1222,6 +1302,7 @@ def process_video(
     # Vectorized store of kept embeddings for fast similarity checks
     kept_mat: Optional[np.ndarray] = None
 
+    dedup_stage_start = time.time()
     total_candidates = max(1, len(candidates))
     dedup_log_every = max(1, total_candidates // 100)
     for idx, cand in enumerate(candidates, start=1):
@@ -1253,14 +1334,71 @@ def process_video(
 
         if progress_only and (idx == total_candidates or idx % dedup_log_every == 0):
             pct = (idx / max(1, total_candidates)) * 100.0
+            stage_elapsed = time.time() - dedup_stage_start
+            total_elapsed = time.time() - overall_start
             try:
                 print(
-                    f"\r[prog] dedup {idx}/{total_candidates} ({pct:.1f}%)",
+                    f"\r[prog] dedup {idx}/{total_candidates} ({pct:.1f}%) "
+                    f"elapsed={stage_elapsed:.1f}s total={total_elapsed:.1f}s",
                     end="" if idx < total_candidates else "\n",
                     flush=True,
                 )
             except Exception:
                 pass
+
+    final_removed: List[
+        Tuple[int, float, float, np.ndarray, Optional[str], Optional[np.ndarray], dict, dict, dict]
+    ] = []
+    new_final_embeddings: List[np.ndarray] = []
+    resolved_final_threshold = final_dedup_threshold if final_dedup_threshold is not None else dedup_threshold
+    resolved_final_threshold = max(0.0, float(resolved_final_threshold))
+    global_final_mat: Optional[np.ndarray] = None
+    if existing_final_mat is not None and existing_final_mat.size > 0:
+        try:
+            global_final_mat = existing_final_mat.astype(np.float32, copy=False)
+        except Exception:
+            global_final_mat = existing_final_mat
+
+    if resolved_final_threshold > 0.0 and kept:
+        final_kept_list: List[
+            Tuple[int, float, float, np.ndarray, Optional[str], Optional[np.ndarray], dict, dict, dict]
+        ] = []
+        chunk_final_mat: Optional[np.ndarray] = None
+        for cand in kept:
+            emb = cand[3]
+            duplicate = False
+            if global_final_mat is not None and global_final_mat.size > 0:
+                try:
+                    sims_prev = global_final_mat.dot(emb)
+                    if sims_prev.size:
+                        prev_dist = 1.0 - float(np.max(sims_prev))
+                        if prev_dist < resolved_final_threshold:
+                            duplicate = True
+                except Exception:
+                    duplicate = False
+            if duplicate:
+                final_removed.append(cand)
+                continue
+            if chunk_final_mat is not None and chunk_final_mat.size > 0:
+                try:
+                    sims_chunk = chunk_final_mat.dot(emb)
+                    if sims_chunk.size:
+                        chunk_dist = 1.0 - float(np.max(sims_chunk))
+                        if chunk_dist < resolved_final_threshold:
+                            final_removed.append(cand)
+                            continue
+                except Exception:
+                    pass
+            final_kept_list.append(cand)
+            new_final_embeddings.append(emb)
+            if chunk_final_mat is None:
+                chunk_final_mat = emb.reshape(1, -1).astype(np.float32, copy=False)
+            else:
+                chunk_final_mat = np.vstack([chunk_final_mat, emb])
+        kept = final_kept_list
+    else:
+        for cand in kept:
+            new_final_embeddings.append(cand[3])
 
     # Persist kept frames in timestamp order for readability
     kept.sort(key=lambda x: x[1])
@@ -1274,6 +1412,7 @@ def process_video(
     except Exception:
         pass
 
+    write_stage_start = time.time()
     for rank, (frame_idx, ts, aest, emb, tmp_path, stored_image, tech, face, comp) in enumerate(kept, start=1):
         insert_frame_row(
             conn=conn,
@@ -1324,9 +1463,12 @@ def process_video(
 
         if progress_only and (rank == 1 or rank == total_kept or rank % progress_step == 0):
             pct = (rank / max(1, total_kept)) * 100.0
+            stage_elapsed = time.time() - write_stage_start
+            total_elapsed = time.time() - overall_start
             try:
                 print(
-                    f"\r[prog] writing kept frames {rank}/{total_kept} ({pct:.1f}%)",
+                    f"\r[prog] writing kept frames {rank}/{total_kept} ({pct:.1f}%) "
+                    f"elapsed={stage_elapsed:.1f}s total={total_elapsed:.1f}s",
                     end="" if rank < total_kept else "\n",
                     flush=True,
                 )
@@ -1338,6 +1480,31 @@ def process_video(
     except Exception:
         pass
 
+    # Move duplicates discarded in final stage
+    for dup in final_removed:
+        frame_idx, ts, aest, emb, tmp_path, stored_image, tech, face, comp = dup
+        dup_name = f"{frame_idx:09d}_t{ts:.2f}_dup.jpg"
+        dest_path = os.path.join(final_removed_dir, dup_name)
+        moved = False
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.replace(tmp_path, dest_path)
+                moved = True
+            except Exception:
+                moved = False
+        if not moved:
+            src_img = stored_image
+            if src_img is None and tmp_path and os.path.exists(tmp_path):
+                try:
+                    src_img = cv2.imread(tmp_path)
+                except Exception:
+                    src_img = None
+            if src_img is not None:
+                try:
+                    cv2.imwrite(dest_path, src_img, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+                except Exception:
+                    pass
+
     if progress_only:
         try:
             print()
@@ -1346,9 +1513,25 @@ def process_video(
 
     shutil.rmtree(tmp_candidate_dir, ignore_errors=True)
     conn.close()
+
+    if new_final_embeddings:
+        try:
+            new_final_mat_arr = np.vstack(new_final_embeddings).astype(np.float32, copy=False)
+            if existing_final_mat is not None and existing_final_mat.size > 0:
+                combined = np.vstack([existing_final_mat, new_final_mat_arr])
+            else:
+                combined = new_final_mat_arr
+            np.save(final_index_path, combined)
+        except Exception:
+            pass
+    elif existing_final_mat is not None and os.path.exists(final_index_path):
+        # keep existing embeddings file as-is
+        pass
+
     total_time = time.time() - overall_start
     print(
-        f"Done. kept={len(kept)} (from {len(candidates)} candidates after filtering). Total time: {total_time:.1f}s"
+        f"Done. kept={len(kept)} (from {len(candidates)} candidates after filtering, "
+        f"final_removed={len(final_removed)}). Total time: {total_time:.1f}s"
     )
 
 
@@ -1402,6 +1585,12 @@ def parse_args() -> argparse.Namespace:
         help="Optional cap on processed seconds per video",
     )
     parser.add_argument(
+        "--chunk-duration-secs",
+        type=float,
+        default=300.0,
+        help="Process videos in chunks of this many seconds (set <=0 to process in a single pass)",
+    )
+    parser.add_argument(
         "--min-aesthetic",
         type=float,
         default=0.0,
@@ -1412,6 +1601,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.15,
         help="Cosine distance threshold to treat two frames as duplicates (default: 0.15)",
+    )
+    parser.add_argument(
+        "--final-dedup-threshold",
+        type=float,
+        default=None,
+        help="Threshold for final-stage deduplication before saving images (default: inherits --dedup-threshold)",
     )
     parser.add_argument(
         "--progress-only",
@@ -1490,6 +1685,17 @@ def parse_args() -> argparse.Namespace:
         default=0.4,
         help="Minimum ratio of vivid blue/yellow pixels to treat as an overlay card (default: 0.4)",
     )
+    parser.add_argument(
+        "--resize-long-edge",
+        type=int,
+        default=0,
+        help="If >0, resize frames so their longest edge equals this value before processing",
+    )
+    parser.add_argument(
+        "--skip-to-final-stage",
+        action="store_true",
+        help="Skip new frame processing and only run final deduplication/output steps",
+    )
     parser.add_argument("--workers", type=int, default=4, help="Number of threads for preprocessing")
     parser.add_argument(
         "--disable-aesthetic",
@@ -1507,38 +1713,90 @@ if __name__ == "__main__":
         raise FileNotFoundError(f"No video files found in directory: {args.video}")
 
     total_videos = len(video_inputs)
+    chunk_duration = float(getattr(args, "chunk_duration_secs", 300.0))
+
     for idx, video_path in enumerate(video_inputs, start=1):
-        if not args.progress_only:
-            prefix = f"[{idx}/{total_videos}] " if total_videos > 1 else ""
-            print(f"{prefix}Processing {video_path}")
-        elif total_videos > 1:
+        if args.progress_only and total_videos > 1:
             try:
                 print(f"[prog] video {idx}/{total_videos}: {video_path}")
             except Exception:
                 pass
 
-        process_video(
-            video_path=video_path,
-            db_path=args.db,
-            frame_stride_sec=args.stride_sec,
-            max_frames=args.max_frames,
-            output_dir=args.output,
-            max_seconds=getattr(args, "max_seconds", None),
-            min_aesthetic=getattr(args, "min_aesthetic", 0.0),
-            dedup_threshold=getattr(args, "dedup_threshold", 0.15),
-            progress_only=getattr(args, "progress_only", False),
-            enable_face_checks=not getattr(args, "disable_face", False),
-            adaptive_stride=getattr(args, "adaptive_stride", False),
-            face_skin_threshold=getattr(args, "face_skin_threshold", 0.05),
-            max_workers=getattr(args, "workers", 4),
-            min_tech_score=getattr(args, "min_tech_score", MIN_TECH_SCORE),
-            require_face=getattr(args, "require_face", False),
-            skip_overlay_cards=getattr(args, "skip_overlay_cards", False),
-            overlay_coverage=getattr(args, "overlay_coverage", 0.3),
-            overlay_sat_threshold=getattr(args, "overlay_sat_threshold", 0.5),
-            overlay_sat_ratio=getattr(args, "overlay_sat_ratio", 0.6),
-            overlay_unique_threshold=getattr(args, "overlay_unique_threshold", 0.2),
-            overlay_hue_dominance=getattr(args, "overlay_hue_dominance", 0.7),
-            overlay_color_ratio=getattr(args, "overlay_color_ratio", 0.4),
-            use_aesthetic=not getattr(args, "disable_aesthetic", False),
-        )
+        duration_sec = get_video_duration(video_path)
+        max_seconds = getattr(args, "max_seconds", None)
+        chunk_plan: List[tuple[float, float | None]] = []
+        if chunk_duration <= 0:
+            chunk_plan.append((0.0, float(max_seconds) if max_seconds is not None else None))
+        else:
+            target_end = duration_sec
+            if max_seconds is not None:
+                target_end = min(target_end, float(max_seconds))
+            if target_end <= 0:
+                chunk_plan.append((0.0, float(max_seconds) if max_seconds is not None else None))
+            else:
+                start_sec = 0.0
+                while start_sec < target_end - 1e-6:
+                    chunk_end = min(target_end, start_sec + chunk_duration)
+                    chunk_plan.append((start_sec, chunk_end))
+                    if chunk_end >= target_end:
+                        break
+                    start_sec = chunk_end
+                if not chunk_plan:
+                    chunk_plan.append((0.0, float(max_seconds) if max_seconds is not None else None))
+
+        prefix = f"[{idx}/{total_videos}] " if not args.progress_only and total_videos > 1 else ""
+
+        cumulative_time = 0.0
+        for chunk_idx, (chunk_start, chunk_end) in enumerate(chunk_plan, start=1):
+            if not args.progress_only:
+                chunk_desc = (
+                    f"{prefix}Processing {video_path} chunk {chunk_idx}/{len(chunk_plan)} "
+                    f"[{chunk_start:.1f}s - {chunk_end if chunk_end is not None else duration_sec:.1f}s]"
+                )
+                print(chunk_desc)
+
+            chunk_start_time = time.time()
+            process_video(
+                video_path=video_path,
+                db_path=args.db,
+                frame_stride_sec=args.stride_sec,
+                max_frames=args.max_frames,
+                output_dir=args.output,
+                max_seconds=chunk_end,
+                min_aesthetic=getattr(args, "min_aesthetic", 0.0),
+                dedup_threshold=getattr(args, "dedup_threshold", 0.15),
+                final_dedup_threshold=getattr(args, "final_dedup_threshold", None),
+                progress_only=getattr(args, "progress_only", False),
+                enable_face_checks=not getattr(args, "disable_face", False),
+                adaptive_stride=getattr(args, "adaptive_stride", False),
+                face_skin_threshold=getattr(args, "face_skin_threshold", 0.05),
+                max_workers=getattr(args, "workers", 4),
+                min_tech_score=getattr(args, "min_tech_score", MIN_TECH_SCORE),
+                require_face=getattr(args, "require_face", False),
+                skip_overlay_cards=getattr(args, "skip_overlay_cards", False),
+                overlay_coverage=getattr(args, "overlay_coverage", 0.3),
+                overlay_sat_threshold=getattr(args, "overlay_sat_threshold", 0.5),
+                overlay_sat_ratio=getattr(args, "overlay_sat_ratio", 0.6),
+                overlay_unique_threshold=getattr(args, "overlay_unique_threshold", 0.2),
+                overlay_hue_dominance=getattr(args, "overlay_hue_dominance", 0.7),
+                overlay_color_ratio=getattr(args, "overlay_color_ratio", 0.4),
+                use_aesthetic=not getattr(args, "disable_aesthetic", False),
+                start_sec=chunk_start,
+                resize_long_edge=getattr(args, "resize_long_edge", 0),
+                skip_to_final_stage=getattr(args, "skip_to_final_stage", False),
+            )
+            chunk_elapsed = time.time() - chunk_start_time
+            cumulative_time += chunk_elapsed
+            if args.progress_only:
+                try:
+                    print(
+                        f"[prog] chunk {chunk_idx}/{len(chunk_plan)} done "
+                        f"(chunk={chunk_elapsed:.1f}s total={cumulative_time:.1f}s)"
+                    )
+                except Exception:
+                    pass
+            else:
+                print(
+                    f"{prefix}Finished chunk {chunk_idx}/{len(chunk_plan)} "
+                    f"(chunk {chunk_elapsed:.1f}s, cumulative {cumulative_time:.1f}s)"
+                )

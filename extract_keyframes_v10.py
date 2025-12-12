@@ -27,6 +27,123 @@ except ImportError:  # pragma: no cover - optional dependency
 
 
 # ============================================================
+# Smile detector (OpenCV Haar cascade)
+# ============================================================
+
+def _ensure_smile_cascade() -> Optional[cv2.CascadeClassifier]:
+    global _SMILE_CASCADE
+    if _SMILE_CASCADE is not None:
+        return _SMILE_CASCADE
+    try:
+        cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_smile.xml")
+        if os.path.exists(cascade_path):
+            _SMILE_CASCADE = cv2.CascadeClassifier(cascade_path)
+    except Exception:
+        _SMILE_CASCADE = None
+    return _SMILE_CASCADE
+
+
+def detect_smile(face_img: np.ndarray) -> bool:
+    smile_cascade = _ensure_smile_cascade()
+    if smile_cascade is None or face_img.size == 0:
+        return False
+    try:
+        gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
+        smiles = smile_cascade.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=20, minSize=(20, 20))
+        return len(smiles) > 0
+    except Exception:
+        return False
+
+
+def _ensure_secondary_face_detector() -> Optional[cv2.CascadeClassifier]:
+    global _SECONDARY_FACE_CASCADE
+    if _SECONDARY_FACE_CASCADE is not None:
+        return _SECONDARY_FACE_CASCADE
+    try:
+        cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
+        if os.path.exists(cascade_path):
+            _SECONDARY_FACE_CASCADE = cv2.CascadeClassifier(cascade_path)
+    except Exception:
+        _SECONDARY_FACE_CASCADE = None
+    return _SECONDARY_FACE_CASCADE
+
+
+def detect_secondary_face(frame_bgr: np.ndarray) -> Optional[dict]:
+    cascade = _ensure_secondary_face_detector()
+    if cascade is None:
+        return None
+    try:
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
+        if len(faces) == 0:
+            return None
+        x, y, w, h = max(faces, key=lambda rect: rect[2] * rect[3])
+        bbox = (int(x), int(y), int(x + w), int(y + h))
+        rel_area = float((w * h) / max(1, frame_bgr.shape[0] * frame_bgr.shape[1]))
+        try:
+            face_region = frame_bgr[y : y + h, x : x + w]
+            face_gray = cv2.cvtColor(face_region, cv2.COLOR_BGR2GRAY)
+            sharpness = float(cv2.Laplacian(face_gray, cv2.CV_64F).var())
+        except Exception:
+            sharpness = 0.0
+        return {
+            "bbox": bbox,
+            "rel_area": rel_area,
+            "sharpness": sharpness,
+        }
+    except Exception:
+        return None
+
+
+def _ensure_pedestrian_detector() -> Optional[cv2.HOGDescriptor]:
+    global _HOG_PEDESTRIAN
+    if _HOG_PEDESTRIAN is not None:
+        return _HOG_PEDESTRIAN
+    try:
+        hog = cv2.HOGDescriptor()
+        hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        _HOG_PEDESTRIAN = hog
+    except Exception:
+        _HOG_PEDESTRIAN = None
+    return _HOG_PEDESTRIAN
+
+
+def estimate_person_ratio(frame_bgr: np.ndarray) -> float:
+    hog = _ensure_pedestrian_detector()
+    if hog is None:
+        return 0.0
+    try:
+        h, w = frame_bgr.shape[:2]
+        if h <= 0 or w <= 0:
+            return 0.0
+        max_edge = max(h, w)
+        scale = 1.0
+        resized = frame_bgr
+        if max_edge > 640:
+            scale = 640.0 / float(max_edge)
+            new_w = max(1, int(round(w * scale)))
+            new_h = max(1, int(round(h * scale)))
+            resized = cv2.resize(frame_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        resized_gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+        rects, _ = hog.detectMultiScale(
+            resized_gray,
+            winStride=(8, 8),
+            padding=(8, 8),
+            scale=1.05,
+        )
+        total_area = float(h * w)
+        if total_area <= 0:
+            return 0.0
+        area_sum = 0.0
+        inv_scale = 1.0 / max(scale, 1e-6)
+        for (rx, ry, rw, rh) in rects:
+            area_sum += float((rw * inv_scale) * (rh * inv_scale))
+        return min(1.0, float(area_sum / total_area))
+    except Exception:
+        return 0.0
+
+
+# ============================================================
 # Global configuration
 # ============================================================
 
@@ -40,6 +157,9 @@ _AESTHETIC_HEAD = None
 _AESTHETIC_DEVICE = None
 
 _FACE_ANALYZER: Optional[FaceAnalysis] = None
+_SMILE_CASCADE: Optional[cv2.CascadeClassifier] = None
+_SECONDARY_FACE_CASCADE: Optional[cv2.CascadeClassifier] = None
+_HOG_PEDESTRIAN: Optional[cv2.HOGDescriptor] = None
 
 VIDEO_EXTENSIONS = (
     ".mp4",
@@ -390,14 +510,24 @@ def compute_face_features(frame_bgr: np.ndarray) -> dict:
     face_quality_score = 100.0 * float(0.6 * main_conf + 0.4 * size_score)
 
     face_region = frame_bgr[y_min:y_max, x_min:x_max]
+    face_sharpness_var = 0.0
+    face_tilt_deg = 0.0
     if face_region.size > 0:
         try:
             face_gray = cv2.cvtColor(face_region, cv2.COLOR_BGR2GRAY)
             face_sharpness_var = float(cv2.Laplacian(face_gray, cv2.CV_64F).var())
         except Exception:
             face_sharpness_var = 0.0
-    else:
-        face_sharpness_var = 0.0
+        try:
+            kps = getattr(main_face, "kps", None)
+            if kps is not None and len(kps) >= 2:
+                left_eye = kps[0]
+                right_eye = kps[1]
+                dy = float(right_eye[1] - left_eye[1])
+                dx = float(right_eye[0] - left_eye[0])
+                face_tilt_deg = float(np.degrees(np.arctan2(dy, dx)))
+        except Exception:
+            face_tilt_deg = 0.0
 
     return {
         "num_faces": num_faces,
@@ -408,6 +538,7 @@ def compute_face_features(frame_bgr: np.ndarray) -> dict:
         "face_size_score": size_score,
         "face_quality_score": face_quality_score,
         "face_sharpness_var": face_sharpness_var,
+        "face_tilt_deg": face_tilt_deg,
     }
 
 
@@ -528,6 +659,8 @@ MIN_COMPOSITION_SCORE = 60.0
 MIN_FACE_MIN_DIM_RATIO = 0.12  # minimum fraction of shorter edge for face min dimension
 FACE_ASPECT_MIN = 0.6
 FACE_ASPECT_MAX = 1.8
+MIN_FACE_SHARPNESS = 60.0
+MAX_FACE_TILT_DEGREES = 35.0
 
 # ============================================================
 # Embedding model (timm)
@@ -743,6 +876,7 @@ def extract_frames(
     video_path: str,
     frame_stride_sec: float,
     max_seconds: float | None = None,
+    start_sec: float = 0.0,
 ) -> Tuple[Iterable[Tuple[int, float, np.ndarray]], int, float]:
     """
     Stream frames sampled by stride: yields (frame_idx, timestamp_sec, frame_bgr).
@@ -757,9 +891,11 @@ def extract_frames(
         fps = 25.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     stride_frames = max(1, int(round(frame_stride_sec * fps)))
+    start_sec = max(0.0, float(start_sec))
+    start_frame = int(min(total_frames, max(0, round(start_sec * fps))))
 
     def _frame_iter() -> Iterable[Tuple[int, float, np.ndarray]]:
-        frame_idx = 0
+        frame_idx = start_frame
         try:
             while frame_idx < total_frames:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
@@ -775,6 +911,18 @@ def extract_frames(
             cap.release()
 
     return _frame_iter(), total_frames, float(fps)
+
+
+def get_video_duration(video_path: str) -> float:
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return 0.0
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    cap.release()
+    if fps <= 0:
+        fps = 25.0
+    return float(total_frames) / max(fps, 1e-6)
 
 
 # ============================================================
@@ -893,8 +1041,33 @@ def insert_frame_row(
     )
 
 
-def clear_previous_video(conn: duckdb.DuckDBPyConnection, video_path: str) -> None:
-    conn.execute("DELETE FROM frames WHERE video_path = ?", [video_path])
+def canonical_video_key(path: str) -> str:
+    try:
+        return os.path.realpath(os.path.abspath(path))
+    except Exception:
+        try:
+            return os.path.abspath(path)
+        except Exception:
+            return path
+
+
+def video_path_aliases(path: str) -> List[str]:
+    aliases = {path}
+    try:
+        aliases.add(os.path.abspath(path))
+    except Exception:
+        pass
+    try:
+        aliases.add(os.path.realpath(path))
+    except Exception:
+        pass
+    return list(aliases)
+
+
+def clear_previous_video(conn: duckdb.DuckDBPyConnection, video_paths: Iterable[str]) -> None:
+    unique_paths = list(dict.fromkeys(video_paths))
+    for alias in unique_paths:
+        conn.execute("DELETE FROM frames WHERE video_path = ?", [alias])
 
 
 # ============================================================
@@ -910,15 +1083,28 @@ def process_video(
     max_seconds: float | None = None,
     min_aesthetic: float = 0.0,
     dedup_threshold: float = 0.15,
+    final_dedup_threshold: float | None = None,
     progress_only: bool = False,
     enable_face_checks: bool = True,
     adaptive_stride: bool = False,
+    adaptive_stride_threshold: float = 3.0,
     face_skin_threshold: float = 0.05,
+    max_face_tilt: float = MAX_FACE_TILT_DEGREES,
     max_workers: int = 4,
     black_frame_threshold: float = 0.05,
     black_frame_ratio: float = 0.05,
     min_tech_score: float = MIN_TECH_SCORE,
     require_face: bool = False,
+    allow_faceless_scenes: bool = False,
+    faceless_min_aesthetic: float = 5.0,
+    allow_faceless_scenic_only: bool = False,
+    faceless_max_skin_ratio: float = 0.05,
+    faceless_motion_threshold: float = 2.0,
+    faceless_confidence_threshold: float = 0.3,
+    faceless_people_ratio: float = 0.05,
+    min_face_area_ratio: float = 0.0,
+    min_face_y_center: float = 0.0,
+    face_sharpness_threshold: float = MIN_FACE_SHARPNESS,
     skip_overlay_cards: bool = False,
     overlay_coverage: float = 0.3,
     overlay_sat_threshold: float = 0.5,
@@ -927,55 +1113,94 @@ def process_video(
     overlay_hue_dominance: float = 0.7,
     overlay_color_ratio: float = 0.4,
     use_aesthetic: bool = True,
+    start_sec: float = 0.0,
+    resize_long_edge: int = 0,
+    skip_to_final_stage: bool = False,
+    prefer_smiles: bool = True,
 ) -> None:
     overall_start = time.time()
+    start_sec = max(0.0, float(start_sec))
+    first_chunk = start_sec <= 1e-6
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video not found: {video_path}")
+    video_db_key = canonical_video_key(video_path)
+    video_key_aliases = video_path_aliases(video_path)
 
     if not progress_only:
-        print(f"Opening DuckDB at {db_path}")
+        chunk_label = (
+            f"[chunk {start_sec:.1f}s - {max_seconds if max_seconds is not None else 'end'}s]"
+        )
+        print(f"Opening DuckDB at {db_path} {chunk_label}")
     conn = duckdb.connect(database=db_path)
     init_db(conn)
 
     # Prepare image output directory as <output>/<video_name>/
     video_name = os.path.splitext(os.path.basename(video_path))[0]
     video_out_dir = os.path.join(output_dir, video_name)
-    if os.path.exists(video_out_dir):
+    if first_chunk and os.path.exists(video_out_dir):
         shutil.rmtree(video_out_dir)
     os.makedirs(video_out_dir, exist_ok=True)
+
+    final_index_path = os.path.join(video_out_dir, "_final_embeddings.npy")
+    final_removed_dir = os.path.join(video_out_dir, "finally_removed")
+    if first_chunk:
+        shutil.rmtree(final_removed_dir, ignore_errors=True)
+        try:
+            os.remove(final_index_path)
+        except Exception:
+            pass
+    os.makedirs(final_removed_dir, exist_ok=True)
 
     filtered_dir = os.path.join(video_out_dir, "filtered")
     os.makedirs(filtered_dir, exist_ok=True)
 
-    tmp_candidate_dir = os.path.join(video_out_dir, "_candidates_tmp")
+    tmp_candidate_dir = os.path.join(
+        video_out_dir, f"_candidates_tmp_{int(round(start_sec * 1000.0))}"
+    )
     os.makedirs(tmp_candidate_dir, exist_ok=True)
 
-    clear_previous_video(conn, video_path)
+    if first_chunk:
+        clear_previous_video(conn, video_key_aliases)
 
     max_seconds = float(max_seconds) if max_seconds is not None else None
-
-    if not progress_only:
-        print(
-            f"Extracting frames from {video_path} (stride {frame_stride_sec}s, max_seconds={max_seconds})..."
-        )
-    frame_iter, total_frames_est, video_fps = extract_frames(video_path, frame_stride_sec, max_seconds)
-    stride_frames = max(1, int(round(frame_stride_sec * video_fps)))
-    est_frame_cap = (total_frames_est // stride_frames) + 1
-    if max_seconds is not None:
-        est_frame_cap = min(
-            est_frame_cap,
-            int((max_seconds * max(video_fps, 1e-6)) // stride_frames) + 1,
-        )
-    if not progress_only:
-        print(f"Streaming frames (est. {est_frame_cap} frames within limit)")
 
     candidates: List[
         Tuple[int, float, float, np.ndarray, Optional[str], Optional[np.ndarray], dict, dict, dict]
     ] = []
 
-    total_frames = max(1, est_frame_cap)
-    progress_log_interval = max(1, total_frames // 100)
+    total_frames = 1
+    progress_log_interval = 1
     start_time = time.time()
+    existing_final_mat: Optional[np.ndarray] = None
+    if os.path.exists(final_index_path):
+        try:
+            existing_final_mat = np.load(final_index_path)
+        except Exception:
+            existing_final_mat = None
+
+    if skip_to_final_stage:
+        frame_iter = []
+        est_frame_cap = 0
+        video_fps = 25.0
+    else:
+        if not progress_only:
+            print(
+                f"Extracting frames from {video_path} "
+                f"(stride {frame_stride_sec}s, chunk_start={start_sec}, max_seconds={max_seconds})..."
+            )
+        frame_iter, total_frames_est, video_fps = extract_frames(
+            video_path, frame_stride_sec, max_seconds, start_sec=start_sec
+        )
+        stride_frames = max(1, int(round(frame_stride_sec * video_fps)))
+        total_duration_sec = total_frames_est / max(video_fps, 1e-6)
+        chunk_end = max_seconds if max_seconds is not None else total_duration_sec
+        chunk_span = max(0.0, chunk_end - start_sec)
+        est_frame_cap = int((chunk_span * max(video_fps, 1e-6)) // stride_frames) + 1
+        if not progress_only:
+            print(f"Streaming frames (est. {est_frame_cap} frames within limit)")
+
+        total_frames = max(1, est_frame_cap)
+        progress_log_interval = max(1, total_frames // 100)
 
     def save_filtered_frame(frame_img: np.ndarray, reason: str, details: Optional[dict] = None) -> None:
         slug = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in reason.lower())
@@ -1004,10 +1229,11 @@ def process_video(
         mask = cv2.inRange(hsv, (0, 48, 80), (20, 255, 255))
         return float(mask.mean() / 255.0)
 
-    def should_run_face(frame: np.ndarray) -> bool:
+    def should_run_face(frame: np.ndarray, precomputed_skin: Optional[float] = None) -> bool:
         if not enable_face_checks or FaceAnalysis is None:
             return False
-        return skin_probability(frame) >= face_skin_threshold
+        ratio = precomputed_skin if precomputed_skin is not None else skin_probability(frame)
+        return ratio >= face_skin_threshold
 
     def looks_like_overlay_card(
         frame: np.ndarray,
@@ -1069,26 +1295,54 @@ def process_video(
                 return True
         return False
 
-    def process_frame(frame_idx: int, ts: float, frame_bgr: np.ndarray) -> Optional[tuple]:
-        tech = compute_technical_quality(frame_bgr)
+    def process_frame(
+        frame_idx: int,
+        ts: float,
+        frame_bgr: np.ndarray,
+        frame_skin_prob: Optional[float] = None,
+        frame_motion_score: Optional[float] = None,
+    ) -> Optional[tuple]:
+        original_frame = frame_bgr
+        proc_frame = frame_bgr
+        quality_scale = 1.0
+        if resize_long_edge > 0:
+            h0, w0 = original_frame.shape[:2]
+            long_edge_src = max(h0, w0)
+            if long_edge_src > resize_long_edge:
+                scale = float(resize_long_edge) / float(long_edge_src)
+                new_w = max(1, int(round(w0 * scale)))
+                new_h = max(1, int(round(h0 * scale)))
+                try:
+                    proc_frame = cv2.resize(original_frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                except Exception:
+                    proc_frame = original_frame
+                quality_scale = scale
+            else:
+                quality_scale = 1.0
+        skin_prob = frame_skin_prob if frame_skin_prob is not None else skin_probability(proc_frame)
+        tech = compute_technical_quality(proc_frame)
         long_edge = max(tech["resolution_w"], tech["resolution_h"])
-        if long_edge < MIN_RES_LONG_EDGE or tech["total_pixels"] < MIN_TOTAL_PIXELS:
+        min_res_edge = MIN_RES_LONG_EDGE * quality_scale
+        min_total_pixels = MIN_TOTAL_PIXELS * (quality_scale ** 2)
+        min_res_edge = max(1.0, min_res_edge)
+        min_total_pixels = max(10.0, min_total_pixels)
+        if long_edge < min_res_edge or tech["total_pixels"] < min_total_pixels:
             return None
 
         if tech["tech_score"] < min_tech_score:
             return None
 
         if is_black_slate(
-            cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0,
+            cv2.cvtColor(proc_frame, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0,
             tech["mean_luma"],
             black_frame_threshold,
             black_frame_ratio,
         ):
             return None
 
-        run_face = should_run_face(frame_bgr)
+        run_face = should_run_face(proc_frame, skin_prob)
         if run_face:
-            face = compute_face_features(frame_bgr)
+            face = compute_face_features(proc_frame)
         else:
             face = {
                 "num_faces": 0,
@@ -1099,11 +1353,129 @@ def process_video(
                 "main_face_rel_area": 0.0,
             }
 
-        if require_face and not face.get("has_face", False):
+        faceless_candidate = False
+        face_conf = float(face.get("main_face_conf", 0.0))
+        face_has_detection = bool(face.get("has_face", False))
+        motion_val = frame_motion_score if frame_motion_score is not None else None
+        if require_face:
+            if face_has_detection and face_conf < faceless_confidence_threshold:
+                face_has_detection = False
+            if not face_has_detection:
+                secondary = detect_secondary_face(proc_frame)
+                if secondary is not None:
+                    x_min, y_min, x_max, y_max = secondary["bbox"]
+                    face.update(
+                        {
+                            "has_face": True,
+                            "main_face_bbox": secondary["bbox"],
+                            "main_face_rel_area": float(secondary["rel_area"]),
+                            "face_sharpness_var": max(
+                                float(face.get("face_sharpness_var", 0.0)),
+                                float(secondary.get("sharpness", 0.0)),
+                            ),
+                            "main_face_conf": max(face_conf, faceless_confidence_threshold),
+                        }
+                    )
+                    face_has_detection = True
+                elif allow_faceless_scenes:
+                    faceless_candidate = True
+                else:
+                    return None
+        else:
+            face_has_detection = face.get("has_face", False)
+
+        if faceless_candidate:
+            scenic_ok = True
+            if allow_faceless_scenic_only:
+                scenic_ok = bool(
+                    (skin_prob <= faceless_max_skin_ratio)
+                    or (motion_val is not None and motion_val <= faceless_motion_threshold)
+                )
+                if skin_prob > faceless_max_skin_ratio and (
+                    motion_val is None or motion_val > faceless_motion_threshold
+                ):
+                    scenic_ok = False
+                if scenic_ok:
+                    people_ratio = estimate_person_ratio(proc_frame)
+                    if people_ratio > faceless_people_ratio:
+                        scenic_ok = False
+                if not scenic_ok:
+                    return None
+        elif not face_has_detection and require_face:
             return None
 
+        if face.get("has_face", False):
+            face_sharpness = face.get("face_sharpness_var", 0.0)
+            if face_sharpness < face_sharpness_threshold:
+                save_filtered_frame(
+                    original_frame,
+                    "face_too_blurry",
+                    {
+                        "face_sharpness_var": face_sharpness,
+                        "threshold": face_sharpness_threshold,
+                    },
+                )
+                return None
+            tilt = abs(float(face.get("face_tilt_deg", 0.0)))
+            if tilt > max_face_tilt:
+                save_filtered_frame(
+                    original_frame,
+                    "face_tilted",
+                    {
+                        "face_tilt_deg": tilt,
+                        "max_face_tilt": max_face_tilt,
+                    },
+                )
+                return None
+            face_area = max(0.0, float(face.get("main_face_rel_area", 0.0)))
+            if face_area < max(0.0, float(min_face_area_ratio)):
+                save_filtered_frame(
+                    original_frame,
+                    "face_too_small",
+                    {
+                        "face_area": face_area,
+                        "threshold": min_face_area_ratio,
+                    },
+                )
+                return None
+            bbox = face.get("main_face_bbox")
+            if bbox is not None:
+                x_min, y_min, x_max, y_max = bbox
+                h, _w = proc_frame.shape[:2]
+                center_y = ((y_min + y_max) * 0.5) / max(h, 1)
+            else:
+                center_y = 0.5
+            if center_y < min_face_y_center:
+                save_filtered_frame(
+                    original_frame,
+                    "face_too_low",
+                    {
+                        "center_y": center_y,
+                        "threshold": min_face_y_center,
+                    },
+                )
+                return None
+
+        if face.get("has_face", False):
+            face_sharpness = face.get("face_sharpness_var", 0.0)
+            if face_sharpness < face_sharpness_threshold:
+                return None
+
+        has_smile = False
+        if face.get("has_face") and face.get("main_face_bbox"):
+            x_min, y_min, x_max, y_max = face["main_face_bbox"]
+            h, w = proc_frame.shape[:2]
+            x_min = max(0, min(w, x_min))
+            y_min = max(0, min(h, y_min))
+            x_max = max(0, min(w, x_max))
+            y_max = max(0, min(h, y_max))
+            if x_max > x_min and y_max > y_min:
+                face_patch = proc_frame[y_min:y_max, x_min:x_max]
+                has_smile = detect_smile(face_patch)
+        face["has_smile"] = has_smile
+
         if skip_overlay_cards and looks_like_overlay_card(
-            frame_bgr,
+            proc_frame,
             coverage_ratio=overlay_coverage,
             sat_threshold=overlay_sat_threshold,
             sat_ratio_threshold=overlay_sat_ratio,
@@ -1118,70 +1490,90 @@ def process_video(
             if not (face.get("has_face", False) and face_sharpness >= (0.5 * MIN_SHARPNESS_VAR)):
                 return None
 
-        comp = compute_composition_features(frame_bgr, face_info=face)
+        comp = compute_composition_features(proc_frame, face_info=face)
         if use_aesthetic:
-            aest = compute_aesthetic_score(frame_bgr)
-            if aest < float(min_aesthetic):
+            aest = compute_aesthetic_score(proc_frame)
+            threshold = faceless_min_aesthetic if faceless_candidate else float(min_aesthetic)
+            if aest < float(threshold):
                 return None
         else:
             aest = 0.0
-        emb = compute_embedding(frame_bgr)
+            if faceless_candidate:
+                return None
+        emb = compute_embedding(proc_frame)
 
         tmp_fname = f"{frame_idx:09d}_t{ts:.2f}.jpg"
         tmp_path = os.path.join(tmp_candidate_dir, tmp_fname)
         stored_image: Optional[np.ndarray] = None
         try:
-            ok = cv2.imwrite(tmp_path, frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            ok = cv2.imwrite(tmp_path, original_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
             if not ok:
                 tmp_path = ""
         except Exception:
             tmp_path = ""
         if not tmp_path:
-            stored_image = frame_bgr.copy()
+            stored_image = original_frame.copy()
 
         return (frame_idx, ts, float(aest), emb, tmp_path, stored_image, tech, face, comp)
 
     workers = max(1, max_workers)
-    executor = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+    executor = ThreadPoolExecutor(max_workers=workers) if workers > 1 and not skip_to_final_stage else None
     futures = []
     prev_frame = None
 
-    for i, (frame_idx, ts, frame_bgr) in enumerate(frame_iter, start=1):
-        if not progress_only:
-            print(f"[{i}/{total_frames}] frame_index={frame_idx}, t={ts:.2f}s")
-        elif i == 1 or (i % progress_log_interval == 0) or i == total_frames:
-            pct = (float(i) / float(total_frames)) * 100.0
-            elapsed = time.time() - start_time
-            remaining = (elapsed / max(i, 1)) * (total_frames - i)
-            try:
-                print(
-                    f"\r[prog] frames {i}/{total_frames} ({pct:.1f}%) "
-                    f"elapsed={elapsed:.1f}s left={max(0.0, remaining):.1f}s",
-                    end="" if i < total_frames else "\n",
-                    flush=True,
+    if not skip_to_final_stage:
+        for i, (frame_idx, ts, frame_bgr) in enumerate(frame_iter, start=1):
+            if not progress_only:
+                print(f"[{i}/{total_frames}] frame_index={frame_idx}, t={ts:.2f}s")
+            elif i == 1 or (i % progress_log_interval == 0) or i == total_frames:
+                pct = (float(i) / float(total_frames)) * 100.0
+                elapsed = time.time() - start_time
+                total_elapsed = time.time() - overall_start
+                remaining = (elapsed / max(i, 1)) * (total_frames - i)
+                try:
+                    print(
+                        f"\r[prog] frames {i}/{total_frames} ({pct:.1f}%) "
+                        f"elapsed={elapsed:.1f}s total={total_elapsed:.1f}s "
+                        f"left={max(0.0, remaining):.1f}s",
+                        end="" if i < total_frames else "\n",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
+
+            if max_seconds is not None and ts >= max_seconds:
+                break
+
+            motion_score = None
+            if prev_frame is not None:
+                diff = cv2.absdiff(prev_frame, frame_bgr)
+                motion_score = float(diff.mean())
+                if adaptive_stride and motion_score < adaptive_stride_threshold:
+                    prev_frame = frame_bgr
+                    continue
+            prev_frame = frame_bgr
+
+            frame_skin_prob = skin_probability(frame_bgr)
+            frame_payload = frame_bgr.copy() if executor else frame_bgr
+            if executor:
+                futures.append(
+                    executor.submit(
+                        process_frame,
+                        frame_idx,
+                        ts,
+                        frame_payload,
+                        frame_skin_prob,
+                        motion_score,
+                    )
                 )
-            except Exception:
-                pass
+            else:
+                result = process_frame(frame_idx, ts, frame_payload, frame_skin_prob, motion_score)
+                if result:
+                    candidates.append(result)
+                    if max_frames is not None and len(candidates) >= max_frames:
+                        break
 
-        if max_seconds is not None and ts >= max_seconds:
-            break
-
-        if adaptive_stride and prev_frame is not None:
-            diff = cv2.absdiff(prev_frame, frame_bgr)
-            if diff.mean() < 3.0:
-                prev_frame = frame_bgr
-                continue
-        prev_frame = frame_bgr
-
-        if executor:
-            futures.append(executor.submit(process_frame, frame_idx, ts, frame_bgr.copy()))
-        else:
-            result = process_frame(frame_idx, ts, frame_bgr)
-            if result:
-                candidates.append(result)
-                if max_frames is not None and len(candidates) >= max_frames:
-                    break
-
+    filter_stage_start = time.time()
     if executor:
         total_jobs = len(futures)
         completed_jobs = 0
@@ -1195,9 +1587,12 @@ def process_video(
             completed_jobs += 1
             if progress_only and (completed_jobs == total_jobs or completed_jobs % log_every == 0):
                 pct = (completed_jobs / max(1, total_jobs)) * 100.0
+                stage_elapsed = time.time() - filter_stage_start
+                total_elapsed = time.time() - overall_start
                 try:
                     print(
-                        f"\r[prog] filtering {completed_jobs}/{total_jobs} ({pct:.1f}%)",
+                        f"\r[prog] filtering {completed_jobs}/{total_jobs} ({pct:.1f}%) "
+                        f"elapsed={stage_elapsed:.1f}s total={total_elapsed:.1f}s",
                         end="" if completed_jobs < total_jobs else "\n",
                         flush=True,
                     )
@@ -1205,7 +1600,7 @@ def process_video(
                     pass
         executor.shutdown(wait=True)
 
-    if hasattr(frame_iter, "close"):
+    if hasattr(frame_iter, "close") and not skip_to_final_stage:
         try:
             frame_iter.close()  # type: ignore[attr-defined]
         except Exception:
@@ -1222,6 +1617,7 @@ def process_video(
     # Vectorized store of kept embeddings for fast similarity checks
     kept_mat: Optional[np.ndarray] = None
 
+    dedup_stage_start = time.time()
     total_candidates = max(1, len(candidates))
     dedup_log_every = max(1, total_candidates // 100)
     for idx, cand in enumerate(candidates, start=1):
@@ -1238,14 +1634,35 @@ def process_video(
         # Vectorized cosine similarity (embeddings are L2-normalized)
         try:
             sims = kept_mat.dot(emb)  # shape (K,)
-            max_sim = float(np.max(sims)) if sims.size else -1.0
+            if sims.size:
+                best_idx = int(np.argmax(sims))
+                max_sim = float(sims[best_idx])
+            else:
+                best_idx = -1
+                max_sim = -1.0
         except Exception:
-            # Fallback to scalar loop in rare failure cases
             sims = [float(np.dot(k, emb)) for k in kept_mat]  # type: ignore[arg-type]
-            max_sim = max(sims) if sims else -1.0
+            if sims:
+                max_sim = max(sims)
+                best_idx = sims.index(max_sim)
+            else:
+                max_sim = -1.0
+                best_idx = -1
         min_dist = 1.0 - max_sim
         if min_dist < effective_threshold:
-            # duplicate detected, skip (higher-aesthetic already kept)
+            replace_existing = False
+            if prefer_smiles and best_idx >= 0:
+                existing_entry = kept[best_idx]
+                existing_face = existing_entry[7]
+                existing_smile = bool(existing_face.get("has_smile"))
+                candidate_smile = bool(face.get("has_smile"))
+                if candidate_smile and not existing_smile:
+                    replace_existing = True
+                elif candidate_smile == existing_smile and float(aest) > float(existing_entry[2]):
+                    replace_existing = True
+            if replace_existing and best_idx >= 0:
+                kept[best_idx] = cand
+                kept_mat[best_idx] = emb
             continue
 
         kept.append(cand)
@@ -1253,14 +1670,90 @@ def process_video(
 
         if progress_only and (idx == total_candidates or idx % dedup_log_every == 0):
             pct = (idx / max(1, total_candidates)) * 100.0
+            stage_elapsed = time.time() - dedup_stage_start
+            total_elapsed = time.time() - overall_start
             try:
                 print(
-                    f"\r[prog] dedup {idx}/{total_candidates} ({pct:.1f}%)",
+                    f"\r[prog] dedup {idx}/{total_candidates} ({pct:.1f}%) "
+                    f"elapsed={stage_elapsed:.1f}s total={total_elapsed:.1f}s",
                     end="" if idx < total_candidates else "\n",
                     flush=True,
                 )
             except Exception:
                 pass
+
+    final_removed: List[
+        Tuple[int, float, float, np.ndarray, Optional[str], Optional[np.ndarray], dict, dict, dict]
+    ] = []
+    new_final_embeddings: List[np.ndarray] = []
+    resolved_final_threshold = final_dedup_threshold if final_dedup_threshold is not None else dedup_threshold
+    resolved_final_threshold = max(0.0, float(resolved_final_threshold))
+    global_final_mat: Optional[np.ndarray] = None
+    if existing_final_mat is not None and existing_final_mat.size > 0:
+        try:
+            global_final_mat = existing_final_mat.astype(np.float32, copy=False)
+        except Exception:
+            global_final_mat = existing_final_mat
+
+    if resolved_final_threshold > 0.0 and kept:
+        final_kept_list: List[
+            Tuple[int, float, float, np.ndarray, Optional[str], Optional[np.ndarray], dict, dict, dict]
+        ] = []
+        chunk_final_mat: Optional[np.ndarray] = None
+        for cand in kept:
+            emb = cand[3]
+            duplicate = False
+            if global_final_mat is not None and global_final_mat.size > 0:
+                try:
+                    sims_prev = global_final_mat.dot(emb)
+                    if sims_prev.size:
+                        prev_dist = 1.0 - float(np.max(sims_prev))
+                        if prev_dist < resolved_final_threshold:
+                            duplicate = True
+                except Exception:
+                    duplicate = False
+            if duplicate:
+                final_removed.append(cand)
+                continue
+            replaced_chunk_entry = False
+            chunk_best_idx = -1
+            if chunk_final_mat is not None and chunk_final_mat.size > 0:
+                try:
+                    sims_chunk = chunk_final_mat.dot(emb)
+                    if sims_chunk.size:
+                        chunk_best_idx = int(np.argmax(sims_chunk))
+                        chunk_dist = 1.0 - float(sims_chunk[chunk_best_idx])
+                        if chunk_dist < resolved_final_threshold:
+                            if prefer_smiles and chunk_best_idx >= 0:
+                                existing_entry = final_kept_list[chunk_best_idx]
+                                existing_face = existing_entry[7]
+                                existing_smile = bool(existing_face.get("has_smile"))
+                                candidate_smile = bool(face.get("has_smile"))
+                                if candidate_smile and not existing_smile:
+                                    replaced_chunk_entry = True
+                                elif candidate_smile == existing_smile and float(aest) > float(existing_entry[2]):
+                                    replaced_chunk_entry = True
+                            if not replaced_chunk_entry:
+                                final_removed.append(cand)
+                                continue
+                except Exception:
+                    pass
+            if replaced_chunk_entry and chunk_best_idx >= 0:
+                final_removed.append(final_kept_list[chunk_best_idx])
+                final_kept_list[chunk_best_idx] = cand
+                chunk_final_mat[chunk_best_idx] = emb
+                new_final_embeddings.append(emb)
+            else:
+                final_kept_list.append(cand)
+                new_final_embeddings.append(emb)
+                if chunk_final_mat is None:
+                    chunk_final_mat = emb.reshape(1, -1).astype(np.float32, copy=False)
+                else:
+                    chunk_final_mat = np.vstack([chunk_final_mat, emb])
+        kept = final_kept_list
+    else:
+        for cand in kept:
+            new_final_embeddings.append(cand[3])
 
     # Persist kept frames in timestamp order for readability
     kept.sort(key=lambda x: x[1])
@@ -1274,10 +1767,11 @@ def process_video(
     except Exception:
         pass
 
+    write_stage_start = time.time()
     for rank, (frame_idx, ts, aest, emb, tmp_path, stored_image, tech, face, comp) in enumerate(kept, start=1):
         insert_frame_row(
             conn=conn,
-            video_path=video_path,
+            video_path=video_db_key,
             frame_index=frame_idx,
             timestamp_sec=ts,
             aesthetic=aest,
@@ -1324,9 +1818,12 @@ def process_video(
 
         if progress_only and (rank == 1 or rank == total_kept or rank % progress_step == 0):
             pct = (rank / max(1, total_kept)) * 100.0
+            stage_elapsed = time.time() - write_stage_start
+            total_elapsed = time.time() - overall_start
             try:
                 print(
-                    f"\r[prog] writing kept frames {rank}/{total_kept} ({pct:.1f}%)",
+                    f"\r[prog] writing kept frames {rank}/{total_kept} ({pct:.1f}%) "
+                    f"elapsed={stage_elapsed:.1f}s total={total_elapsed:.1f}s",
                     end="" if rank < total_kept else "\n",
                     flush=True,
                 )
@@ -1338,6 +1835,31 @@ def process_video(
     except Exception:
         pass
 
+    # Move duplicates discarded in final stage
+    for dup in final_removed:
+        frame_idx, ts, aest, emb, tmp_path, stored_image, tech, face, comp = dup
+        dup_name = f"{frame_idx:09d}_t{ts:.2f}_dup.jpg"
+        dest_path = os.path.join(final_removed_dir, dup_name)
+        moved = False
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.replace(tmp_path, dest_path)
+                moved = True
+            except Exception:
+                moved = False
+        if not moved:
+            src_img = stored_image
+            if src_img is None and tmp_path and os.path.exists(tmp_path):
+                try:
+                    src_img = cv2.imread(tmp_path)
+                except Exception:
+                    src_img = None
+            if src_img is not None:
+                try:
+                    cv2.imwrite(dest_path, src_img, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+                except Exception:
+                    pass
+
     if progress_only:
         try:
             print()
@@ -1346,9 +1868,25 @@ def process_video(
 
     shutil.rmtree(tmp_candidate_dir, ignore_errors=True)
     conn.close()
+
+    if new_final_embeddings:
+        try:
+            new_final_mat_arr = np.vstack(new_final_embeddings).astype(np.float32, copy=False)
+            if existing_final_mat is not None and existing_final_mat.size > 0:
+                combined = np.vstack([existing_final_mat, new_final_mat_arr])
+            else:
+                combined = new_final_mat_arr
+            np.save(final_index_path, combined)
+        except Exception:
+            pass
+    elif existing_final_mat is not None and os.path.exists(final_index_path):
+        # keep existing embeddings file as-is
+        pass
+
     total_time = time.time() - overall_start
     print(
-        f"Done. kept={len(kept)} (from {len(candidates)} candidates after filtering). Total time: {total_time:.1f}s"
+        f"Done. kept={len(kept)} (from {len(candidates)} candidates after filtering, "
+        f"final_removed={len(final_removed)}). Total time: {total_time:.1f}s"
     )
 
 
@@ -1364,6 +1902,34 @@ def collect_video_inputs(input_path: str) -> List[str]:
         collected.sort()
         return collected
     raise FileNotFoundError(f"Input path not found: {input_path}")
+
+
+def move_selected_frames_to_output(video_out_dir: str, output_root: str, video_name: str) -> None:
+    if not os.path.isdir(video_out_dir):
+        return
+    try:
+        entries = os.listdir(video_out_dir)
+    except Exception:
+        return
+    for fname in entries:
+        if fname.startswith("_"):
+            continue
+        src_path = os.path.join(video_out_dir, fname)
+        if not os.path.isfile(src_path):
+            continue
+        if not fname.lower().endswith(".jpg"):
+            continue
+        dest_name = f"{video_name}__{fname}"
+        dest_path = os.path.join(output_root, dest_name)
+        suffix = 1
+        while os.path.exists(dest_path):
+            dest_name = f"{video_name}__{suffix}_{fname}"
+            dest_path = os.path.join(output_root, dest_name)
+            suffix += 1
+        try:
+            os.replace(src_path, dest_path)
+        except Exception:
+            pass
 
 
 def parse_args() -> argparse.Namespace:
@@ -1402,6 +1968,12 @@ def parse_args() -> argparse.Namespace:
         help="Optional cap on processed seconds per video",
     )
     parser.add_argument(
+        "--chunk-duration-secs",
+        type=float,
+        default=300.0,
+        help="Process videos in chunks of this many seconds (set <=0 to process in a single pass)",
+    )
+    parser.add_argument(
         "--min-aesthetic",
         type=float,
         default=0.0,
@@ -1412,6 +1984,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.15,
         help="Cosine distance threshold to treat two frames as duplicates (default: 0.15)",
+    )
+    parser.add_argument(
+        "--final-dedup-threshold",
+        type=float,
+        default=None,
+        help="Threshold for final-stage deduplication before saving images (default: inherits --dedup-threshold)",
     )
     parser.add_argument(
         "--progress-only",
@@ -1427,10 +2005,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-face", action="store_true", help="Skip InsightFace checks entirely")
     parser.add_argument("--adaptive-stride", action="store_true", help="Skip stride frames with low motion")
     parser.add_argument(
+        "--adaptive-stride-threshold",
+        type=float,
+        default=3.0,
+        help="Mean absolute difference threshold for adaptive stride skipping (default: 3.0)",
+    )
+    parser.add_argument(
         "--face-skin-threshold",
         type=float,
         default=0.05,
         help="Minimum skin probability to run face detection when enabled",
+    )
+    parser.add_argument(
+        "--max-face-tilt",
+        type=float,
+        default=MAX_FACE_TILT_DEGREES,
+        help=f"Discard frames when main face tilt exceeds this angle in degrees (default: {MAX_FACE_TILT_DEGREES})",
+    )
+    parser.add_argument(
+        "--face-sharpness-threshold",
+        type=float,
+        default=MIN_FACE_SHARPNESS,
+        help=f"Minimum Laplacian variance for the main face before accepting a frame (default: {MIN_FACE_SHARPNESS})",
+    )
+    parser.add_argument(
+        "--min-face-area-ratio",
+        type=float,
+        default=0.0,
+        help="Minimum relative frame area (0-1) that the detected main face must cover before accepting the frame",
+    )
+    parser.add_argument(
+        "--min-face-y-center",
+        type=float,
+        default=0.0,
+        help="Require the detected main face vertical center (0=top,1=bottom) to be at least this value",
     )
     parser.add_argument(
         "--black-frame-threshold",
@@ -1448,6 +2056,46 @@ def parse_args() -> argparse.Namespace:
         "--require-face",
         action="store_true",
         help="Discard frames that do not contain a detected face",
+    )
+    parser.add_argument(
+        "--allow-faceless-scenes",
+        action="store_true",
+        help="When --require-face is set, still keep frames without faces if they exceed --faceless-min-aesthetic",
+    )
+    parser.add_argument(
+        "--allow-faceless-scenic-only",
+        action="store_true",
+        help="Only allow faceless scenes when they look scenic (low skin coverage or low motion)",
+    )
+    parser.add_argument(
+        "--faceless-min-aesthetic",
+        type=float,
+        default=5.0,
+        help="Minimum aesthetic score required to keep a frame without faces when --allow-faceless-scenes is enabled (default: 5.0)",
+    )
+    parser.add_argument(
+        "--faceless-max-skin-ratio",
+        type=float,
+        default=0.05,
+        help="Maximum skin-coverage ratio allowed when accepting faceless frames",
+    )
+    parser.add_argument(
+        "--faceless-motion-threshold",
+        type=float,
+        default=2.0,
+        help="Maximum mean inter-frame difference to treat a faceless frame as low motion",
+    )
+    parser.add_argument(
+        "--faceless-max-confidence",
+        type=float,
+        default=0.3,
+        help="Only fall back to faceless handling when InsightFace confidence is below this threshold",
+    )
+    parser.add_argument(
+        "--faceless-max-person-ratio",
+        type=float,
+        default=0.05,
+        help="Maximum silhouette ratio from the pedestrian detector when accepting faceless frames",
     )
     parser.add_argument(
         "--skip-overlay-cards",
@@ -1490,6 +2138,22 @@ def parse_args() -> argparse.Namespace:
         default=0.4,
         help="Minimum ratio of vivid blue/yellow pixels to treat as an overlay card (default: 0.4)",
     )
+    parser.add_argument(
+        "--resize-long-edge",
+        type=int,
+        default=0,
+        help="If >0, resize frames so their longest edge equals this value before processing",
+    )
+    parser.add_argument(
+        "--skip-to-final-stage",
+        action="store_true",
+        help="Skip new frame processing and only run final deduplication/output steps",
+    )
+    parser.add_argument(
+        "--no-prefer-smiles",
+        action="store_true",
+        help="Disable preference for smiling faces when resolving duplicates",
+    )
     parser.add_argument("--workers", type=int, default=4, help="Number of threads for preprocessing")
     parser.add_argument(
         "--disable-aesthetic",
@@ -1507,38 +2171,91 @@ if __name__ == "__main__":
         raise FileNotFoundError(f"No video files found in directory: {args.video}")
 
     total_videos = len(video_inputs)
+    chunk_duration = float(getattr(args, "chunk_duration_secs", 300.0))
+
     for idx, video_path in enumerate(video_inputs, start=1):
-        if not args.progress_only:
-            prefix = f"[{idx}/{total_videos}] " if total_videos > 1 else ""
-            print(f"{prefix}Processing {video_path}")
-        elif total_videos > 1:
+        if args.progress_only and total_videos > 1:
             try:
                 print(f"[prog] video {idx}/{total_videos}: {video_path}")
             except Exception:
                 pass
 
-        process_video(
-            video_path=video_path,
-            db_path=args.db,
-            frame_stride_sec=args.stride_sec,
-            max_frames=args.max_frames,
-            output_dir=args.output,
-            max_seconds=getattr(args, "max_seconds", None),
-            min_aesthetic=getattr(args, "min_aesthetic", 0.0),
-            dedup_threshold=getattr(args, "dedup_threshold", 0.15),
-            progress_only=getattr(args, "progress_only", False),
-            enable_face_checks=not getattr(args, "disable_face", False),
-            adaptive_stride=getattr(args, "adaptive_stride", False),
-            face_skin_threshold=getattr(args, "face_skin_threshold", 0.05),
-            max_workers=getattr(args, "workers", 4),
-            min_tech_score=getattr(args, "min_tech_score", MIN_TECH_SCORE),
-            require_face=getattr(args, "require_face", False),
-            skip_overlay_cards=getattr(args, "skip_overlay_cards", False),
-            overlay_coverage=getattr(args, "overlay_coverage", 0.3),
-            overlay_sat_threshold=getattr(args, "overlay_sat_threshold", 0.5),
-            overlay_sat_ratio=getattr(args, "overlay_sat_ratio", 0.6),
-            overlay_unique_threshold=getattr(args, "overlay_unique_threshold", 0.2),
-            overlay_hue_dominance=getattr(args, "overlay_hue_dominance", 0.7),
-            overlay_color_ratio=getattr(args, "overlay_color_ratio", 0.4),
-            use_aesthetic=not getattr(args, "disable_aesthetic", False),
-        )
+        duration_sec = get_video_duration(video_path)
+        max_seconds = getattr(args, "max_seconds", None)
+        chunk_plan: List[tuple[float, float | None]] = []
+        if chunk_duration <= 0:
+            chunk_plan.append((0.0, float(max_seconds) if max_seconds is not None else None))
+        else:
+            target_end = duration_sec
+            if max_seconds is not None:
+                target_end = min(target_end, float(max_seconds))
+            if target_end <= 0:
+                chunk_plan.append((0.0, float(max_seconds) if max_seconds is not None else None))
+            else:
+                start_sec = 0.0
+                while start_sec < target_end - 1e-6:
+                    chunk_end = min(target_end, start_sec + chunk_duration)
+                    chunk_plan.append((start_sec, chunk_end))
+                    if chunk_end >= target_end:
+                        break
+                    start_sec = chunk_end
+                if not chunk_plan:
+                    chunk_plan.append((0.0, float(max_seconds) if max_seconds is not None else None))
+
+        prefix = f"[{idx}/{total_videos}] " if not args.progress_only and total_videos > 1 else ""
+
+        for chunk_idx, (chunk_start, chunk_end) in enumerate(chunk_plan, start=1):
+            if not args.progress_only:
+                chunk_desc = (
+                    f"{prefix}Processing {video_path} chunk {chunk_idx}/{len(chunk_plan)} "
+                    f"[{chunk_start:.1f}s - {chunk_end if chunk_end is not None else duration_sec:.1f}s]"
+                )
+                print(chunk_desc)
+
+            process_video(
+                video_path=video_path,
+                db_path=args.db,
+                frame_stride_sec=args.stride_sec,
+                max_frames=args.max_frames,
+                output_dir=args.output,
+                max_seconds=chunk_end,
+                min_aesthetic=getattr(args, "min_aesthetic", 0.0),
+                dedup_threshold=getattr(args, "dedup_threshold", 0.15),
+                final_dedup_threshold=getattr(args, "final_dedup_threshold", None),
+                progress_only=getattr(args, "progress_only", False),
+                enable_face_checks=not getattr(args, "disable_face", False),
+                adaptive_stride=getattr(args, "adaptive_stride", False),
+                adaptive_stride_threshold=getattr(args, "adaptive_stride_threshold", 3.0),
+                face_skin_threshold=getattr(args, "face_skin_threshold", 0.05),
+                max_face_tilt=getattr(args, "max_face_tilt", MAX_FACE_TILT_DEGREES),
+                face_sharpness_threshold=getattr(args, "face_sharpness_threshold", MIN_FACE_SHARPNESS),
+                min_face_area_ratio=getattr(args, "min_face_area_ratio", 0.0),
+                min_face_y_center=getattr(args, "min_face_y_center", 0.0),
+                max_workers=getattr(args, "workers", 4),
+                min_tech_score=getattr(args, "min_tech_score", MIN_TECH_SCORE),
+                require_face=getattr(args, "require_face", False),
+                allow_faceless_scenes=getattr(args, "allow_faceless_scenes", False),
+                faceless_min_aesthetic=getattr(args, "faceless_min_aesthetic", 5.0),
+                allow_faceless_scenic_only=getattr(args, "allow_faceless_scenic_only", False),
+                faceless_max_skin_ratio=getattr(args, "faceless_max_skin_ratio", 0.05),
+                faceless_motion_threshold=getattr(args, "faceless_motion_threshold", 2.0),
+                faceless_confidence_threshold=getattr(args, "faceless_max_confidence", 0.3),
+                faceless_people_ratio=getattr(args, "faceless_max_person_ratio", 0.05),
+                skip_overlay_cards=getattr(args, "skip_overlay_cards", False),
+                overlay_coverage=getattr(args, "overlay_coverage", 0.3),
+                overlay_sat_threshold=getattr(args, "overlay_sat_threshold", 0.5),
+                overlay_sat_ratio=getattr(args, "overlay_sat_ratio", 0.6),
+                overlay_unique_threshold=getattr(args, "overlay_unique_threshold", 0.2),
+                overlay_hue_dominance=getattr(args, "overlay_hue_dominance", 0.7),
+                overlay_color_ratio=getattr(args, "overlay_color_ratio", 0.4),
+                use_aesthetic=not getattr(args, "disable_aesthetic", False),
+                start_sec=chunk_start,
+                resize_long_edge=getattr(args, "resize_long_edge", 0),
+                skip_to_final_stage=getattr(args, "skip_to_final_stage", False),
+                prefer_smiles=not getattr(args, "no_prefer_smiles", False),
+            )
+
+        if total_videos > 1:
+            video_name = os.path.splitext(os.path.basename(video_path))[0]
+            video_out_dir = os.path.join(args.output, video_name)
+            move_selected_frames_to_output(video_out_dir, args.output, video_name)

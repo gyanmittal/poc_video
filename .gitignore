@@ -23,3 +23,7 @@ __pycache__/
 *_out*/
 face_clusters_out*/
 *.duckdb.wal
+*media*/
+*out*/
+*input_nirmala_full*/
+*archive*/
