@@ -2,6 +2,28 @@
 
 This document tracks the seven extractor scripts that live in `poc_video/`. Each release was created to try a different balance of accuracy vs. throughput. The notes below explain what each script is optimized for, list the notable filtering behavior, and summarize the CLI/parameter differences so you can pick the right one quickly.
 
+## Example Command (v10)
+
+```bash
+python3 poc_video/extract_keyframes_v10.py "${INPUT_PATH}" \
+  --db "${DB_PATH}" \
+  --output "${OUTPUT_DIR}" \
+  --stride-sec 3 \
+  --min-tech-score 60.0 \
+  --min-aesthetic 5.0 \
+  --dedup-threshold 0.2 \
+  --final-dedup-threshold 0.2 \
+  --resize-long-edge 360 \
+  --adaptive-stride \
+  --adaptive-stride-threshold 3.0 \
+  --progress-only \
+  --require-face \
+  --skip-overlay-cards \
+  --chunk-duration-secs 300
+```
+
+Set `INPUT_PATH`, `DB_PATH`, and `OUTPUT_DIR` to the source video (file or directory), DuckDB database file, and destination directory respectively before running.
+
 ## Version Highlights
 
 ### `extract_keyframes.py` (original)
