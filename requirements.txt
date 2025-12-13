@@ -7,3 +7,11 @@ timm
 facenet-pytorch
 Pillow
 ImageHash
+scikit-image
+ftfy
+regex
+git+https://github.com/openai/CLIP.git
+pyiqa
+piq
+insightface
+onnxruntime

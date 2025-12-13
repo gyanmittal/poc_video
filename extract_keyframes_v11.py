@@ -178,7 +178,7 @@ _HOG_PEDESTRIAN: Optional[cv2.HOGDescriptor] = None
 CLIP_SELECTION_THRESHOLD = 5.0
 NIMA_SELECTION_THRESHOLD = 4.75
 PIQ_SELECTION_THRESHOLD = 0.7
-OVERALL_RATING_THRESHOLD = 7.5
+OVERALL_RATING_THRESHOLD = 8.0
 
 VIDEO_EXTENSIONS = (
     ".mp4",
@@ -1258,6 +1258,7 @@ def process_video(
     skip_to_final_stage: bool = False,
     prefer_smiles: bool = True,
     summary_log_path: Optional[str] = None,
+    global_state: Optional[dict] = None,
 ) -> None:
     overall_start = time.time()
     start_sec = max(0.0, float(start_sec))
@@ -1300,6 +1301,12 @@ def process_video(
     os.makedirs(filtered_dir, exist_ok=True)
     rejected_root = os.path.join(output_root, "rejected")
     os.makedirs(rejected_root, exist_ok=True)
+
+    global_registry = global_state
+    if global_registry is not None:
+        global_registry.setdefault("records", [])
+        if "mat" not in global_registry:
+            global_registry["mat"] = None
     tmp_candidate_dir = os.path.join(
         video_out_dir, f"_candidates_tmp_{int(round(start_sec * 1000.0))}"
     )
@@ -1382,7 +1389,7 @@ def process_video(
             f"piq-value-{piq_fmt}_overall-rating-{overall_fmt}.jpg"
         )
 
-    def persist_rejected_candidate(candidate, reason: str) -> None:
+    def persist_rejected_candidate(candidate, reason: str) -> Optional[str]:
         frame_idx, ts, aest, _emb, tmp_path, stored_image, _tech, _face, _comp, score_info = candidate
         name_idx = frame_idx
         dest_name = _build_filename(f"reject_{reason}_", name_idx, ts, score_info)
@@ -1405,8 +1412,9 @@ def process_video(
             except Exception:
                 pass
         record_summary("rejected", name_idx, ts, score_info, dest_path, reason=reason)
+        return dest_path
 
-    def persist_rejected_raw(frame_idx: int, ts: float, frame_img: np.ndarray, reason: str, score_info: Optional[dict] = None) -> None:
+    def persist_rejected_raw(frame_idx: int, ts: float, frame_img: np.ndarray, reason: str, score_info: Optional[dict] = None) -> Optional[str]:
         info = score_info or {"clip": None, "nima": None, "piq": None, "overall": None}
         dest_name = _build_filename(f"reject_{reason}_", frame_idx, ts, info)
         dest_path = os.path.join(rejected_root, dest_name)
@@ -1418,8 +1426,9 @@ def process_video(
         try:
             cv2.imwrite(dest_path, frame_img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
         except Exception:
-            pass
+            dest_path = None
         record_summary("rejected", frame_idx, ts, info, dest_path, reason=reason)
+        return dest_path
 
     def save_filtered_frame(
         frame_idx: int,
@@ -1950,6 +1959,94 @@ def process_video(
         except Exception:
             global_final_mat = existing_final_mat
 
+    def global_duplicate_decision(embedding: np.ndarray, score_info: dict, aest_value: float, face_info: dict) -> tuple[str, Optional[int]]:
+        if global_registry is None or resolved_final_threshold <= 0.0:
+            return ("keep", None)
+        global_mat = global_registry.get("mat")
+        records = global_registry.get("records", [])
+        if global_mat is None or global_mat.size == 0 or not records:
+            return ("keep", None)
+        try:
+            sims = global_mat.dot(embedding)
+        except Exception:
+            sims = []
+        if sims is None or len(sims) == 0:
+            return ("keep", None)
+        best_idx = int(np.argmax(sims))
+        max_sim = float(sims[best_idx])
+        min_dist = 1.0 - max_sim
+        if min_dist >= resolved_final_threshold or best_idx >= len(records):
+            return ("keep", None)
+        existing_record = records[best_idx]
+        existing_quality = existing_record.get(
+            "quality",
+            _quality_score(existing_record.get("aesthetic", 0.0), existing_record.get("score_info")),
+        )
+        candidate_quality = _quality_score(aest_value, score_info)
+        existing_smile = bool(existing_record.get("has_smile"))
+        candidate_smile = bool(face_info.get("has_smile"))
+        if prefer_smiles:
+            if candidate_smile and not existing_smile:
+                return ("replace", best_idx)
+            if existing_smile and not candidate_smile:
+                return ("skip", best_idx)
+        if candidate_quality > existing_quality:
+            return ("replace", best_idx)
+        return ("skip", best_idx)
+
+    def move_existing_selection_to_rejected(record: dict, tag: str) -> Optional[str]:
+        path = record.get("path")
+        if not path or not os.path.exists(path):
+            return None
+        base = os.path.basename(path)
+        dest_name = f"{tag}_{base}"
+        dest_path = os.path.join(rejected_root, dest_name)
+        suffix = 1
+        while os.path.exists(dest_path):
+            dest_path = os.path.join(rejected_root, f"{tag}_{suffix}_{base}")
+            suffix += 1
+        try:
+            os.replace(path, dest_path)
+        except Exception:
+            return path
+        return dest_path
+
+    def register_global_selection(
+        dest_path: str,
+        embedding: np.ndarray,
+        frame_idx: int,
+        ts: float,
+        aest_value: float,
+        score_info: dict,
+        face_info: dict,
+        replace_idx: Optional[int] = None,
+    ) -> None:
+        if global_registry is None:
+            return
+        record = {
+            "path": dest_path,
+            "frame_idx": frame_idx,
+            "ts": ts,
+            "video": video_name,
+            "score_info": dict(score_info) if score_info is not None else {},
+            "quality": _quality_score(aest_value, score_info),
+            "aesthetic": float(aest_value),
+            "has_smile": bool(face_info.get("has_smile")),
+        }
+        if replace_idx is None:
+            mat = global_registry.get("mat")
+            if mat is None:
+                global_registry["mat"] = embedding.reshape(1, -1).astype(np.float32, copy=False)
+            else:
+                global_registry["mat"] = np.vstack([mat, embedding])
+            global_registry.setdefault("records", []).append(record)
+        else:
+            if global_registry.get("mat") is not None:
+                global_registry["mat"][replace_idx] = embedding
+            else:
+                global_registry["mat"] = embedding.reshape(1, -1).astype(np.float32, copy=False)
+            global_registry["records"][replace_idx] = record
+
     if resolved_final_threshold > 0.0 and kept:
         final_kept_list: List[
             Tuple[int, float, float, np.ndarray, Optional[str], Optional[np.ndarray], dict, dict, dict, dict]
@@ -2056,6 +2153,40 @@ def process_video(
             embedding=emb,
         )
 
+        current_candidate = (frame_idx, ts, aest, emb, tmp_path, stored_image, tech, face, comp, score_info)
+        action, dup_idx = global_duplicate_decision(emb, score_info, aest, face)
+        replace_idx = None
+        if action == "skip":
+            if dup_idx is not None:
+                reject_path = persist_rejected_candidate(current_candidate, "global_dedup")
+                dup_path = None
+                if global_registry and dup_idx < len(global_registry.get("records", [])):
+                    dup_path = global_registry["records"][dup_idx].get("path")
+                record_summary(
+                    "rejected",
+                    frame_idx,
+                    ts,
+                    score_info,
+                    reject_path,
+                    reason=f"global_dup_of:{dup_path}",
+                )
+                continue
+        elif action == "replace" and dup_idx is not None and global_registry:
+            replace_idx = dup_idx
+            existing_record = global_registry.get("records", [])[dup_idx]
+            moved_path = move_existing_selection_to_rejected(
+                existing_record,
+                f"global_replaced_{frame_idx:09d}",
+            )
+            record_summary(
+                "global_removed",
+                existing_record.get("frame_idx", -1),
+                existing_record.get("ts", 0.0),
+                existing_record.get("score_info"),
+                moved_path,
+                reason=f"replaced_by:{video_name}:{frame_idx}",
+            )
+
         clip_fmt = _format_score(score_info.get("clip"))
         nima_fmt = _format_score(nima_score)
         piq_fmt = _format_score(piq_score)
@@ -2101,6 +2232,7 @@ def process_video(
                 except Exception:
                     pass
         record_summary("selected", frame_idx, ts, score_info, dest_path)
+        register_global_selection(dest_path, emb, frame_idx, ts, aest, score_info, face, replace_idx=replace_idx)
 
         if progress_only and (rank == 1 or rank == total_kept or rank % progress_step == 0):
             pct = (rank / max(1, total_kept)) * 100.0
@@ -2413,6 +2545,8 @@ if __name__ == "__main__":
     with open(summary_log, "w", encoding="utf-8") as log_f:
         log_f.write("video\tstatus\tframe\tts\tclip\tnima\tpiq\toverall\tfile\treason\n")
 
+    global_state = {"mat": None, "records": []}
+
     for idx, video_path in enumerate(video_inputs, start=1):
         video_msg = f"video {idx}/{total_videos}: {video_path}"
         try:
@@ -2496,6 +2630,7 @@ if __name__ == "__main__":
                 skip_to_final_stage=getattr(args, "skip_to_final_stage", False),
                 prefer_smiles=not getattr(args, "no_prefer_smiles", False),
                 summary_log_path=summary_log,
+                global_state=global_state,
             )
 
         video_name = os.path.splitext(os.path.basename(video_path))[0]

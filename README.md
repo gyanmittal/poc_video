@@ -4,7 +4,7 @@ Extract distinct, high‑quality frames from videos with minimal RAM usage. Fram
 
 ## Getting Started
 
-- Install requirements
+- Install requirements (installs CLIP, NIMA/PIQIQA, InsightFace, etc.)
   ```
   pip3 install -r poc_video/requirements.txt
   ```
@@ -20,6 +20,32 @@ Extract distinct, high‑quality frames from videos with minimal RAM usage. Fram
   ```
   python3 poc_video/cluster_faces_v3.py     --corpus poc_video/sample_data/videos     --output poc_video/face_clusters_out_v3     --detector mtcnn --embedder facenet     --cluster-scope per_video     --db-enable --db-path poc_video/face_cache.duckdb     --progress-only --annotate-clips
   ```
+
+### Extract Keyframes v11 (CLIP + NIMA + PIQ)
+
+`extract_keyframes_v11.py` is the latest pipeline that evaluates every candidate frame with CLIP (LAION head), NIMA (via `pyiqa`), and PIQ CLIPIQA (`piq`). It keeps detailed logs (`extraction_summary.txt`) and saves all rejected frames under `poc_video/out/rejected/` for inspection.
+
+Example command:
+```bash
+python3 poc_video/extract_keyframes_v11.py poc_video/sample_data/videos/ \
+  --db poc_video/video_meta_v11.duckdb \
+  --output poc_video/out \
+  --stride-sec 3 \
+  --min-tech-score 60 \
+  --min-aesthetic 5 \
+  --dedup-threshold 0.15 \
+  --final-dedup-threshold 0.15 \
+  --adaptive-stride \
+  --adaptive-stride-threshold 3.0 \
+  --require-face \
+  --skip-overlay-cards \
+  --chunk-duration-secs 300 \
+  --progress-only
+```
+After the run:
+- Selected frames live directly under `poc_video/out/` with filenames like `out1_t12.34_clip-value-6.1_...`.
+- Rejected frames are written to `poc_video/out/rejected/` with their rejection reason.
+- `poc_video/out/extraction_summary.txt` lists every processed frame, its scores, status, file path, and reason (if rejected).
 
 
 
@@ -78,9 +104,11 @@ python3 poc_video/cluster_faces_v3.py   --corpus poc_video/sample_data/videos   
 ```
 pip3 install -r poc_video/requirements.txt
 ```
-Or directly:
+Or directly (subset shown; see `requirements.txt` for the authoritative list):
 ```
-pip3 install opencv-python torch torchvision numpy duckdb timm facenet-pytorch Pillow ImageHash
+pip3 install opencv-python torch torchvision numpy duckdb timm facenet-pytorch Pillow ImageHash \
+    scikit-image pyiqa piq insightface onnxruntime ftfy regex \
+    git+https://github.com/openai/CLIP.git
 ```
 
 ### System dependencies (macOS)
