@@ -21,6 +21,16 @@ import skimage
 from skimage import restoration, exposure, color
 
 try:
+    import pyiqa  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    pyiqa = None
+
+try:
+    import piq  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    piq = None
+
+try:
     from insightface.app import FaceAnalysis  # type: ignore
 except ImportError:  # pragma: no cover - optional dependency
     FaceAnalysis = None
@@ -155,11 +165,20 @@ _CLIP_MODEL = None
 _CLIP_PREPROCESS = None
 _AESTHETIC_HEAD = None
 _AESTHETIC_DEVICE = None
+_NIMA_METRIC = None
+_NIMA_DEVICE = None
+_PIQ_METRIC = None
+_PIQ_DEVICE = None
 
 _FACE_ANALYZER: Optional[FaceAnalysis] = None
 _SMILE_CASCADE: Optional[cv2.CascadeClassifier] = None
 _SECONDARY_FACE_CASCADE: Optional[cv2.CascadeClassifier] = None
 _HOG_PEDESTRIAN: Optional[cv2.HOGDescriptor] = None
+
+CLIP_SELECTION_THRESHOLD = 5.0
+NIMA_SELECTION_THRESHOLD = 4.75
+PIQ_SELECTION_THRESHOLD = 0.7
+OVERALL_RATING_THRESHOLD = 7.5
 
 VIDEO_EXTENSIONS = (
     ".mp4",
@@ -299,6 +318,96 @@ def compute_aesthetic_score(frame_bgr: np.ndarray) -> float:
         score = _AESTHETIC_HEAD(image_features).squeeze().cpu().item()
 
     return float(score)
+
+
+# ============================================================
+# Additional aesthetic metrics (NIMA, PIQ, OVERALL_RATING)
+# ============================================================
+
+def _score_device() -> str:
+    if _AESTHETIC_DEVICE is not None:
+        return _AESTHETIC_DEVICE
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def _ensure_nima_metric(device: str) -> torch.nn.Module:
+    global _NIMA_METRIC, _NIMA_DEVICE
+    if pyiqa is None:
+        raise RuntimeError("pyiqa is required for NIMA scoring. Install it or disable aesthetic scoring.")
+    if _NIMA_METRIC is None or _NIMA_DEVICE != device:
+        _NIMA_METRIC = pyiqa.create_metric("nima", device=device)
+        _NIMA_DEVICE = device
+    return _NIMA_METRIC
+
+
+def _ensure_piq_metric(device: str) -> torch.nn.Module:
+    global _PIQ_METRIC, _PIQ_DEVICE
+    if piq is None:
+        raise RuntimeError("piq is required for CLIPIQA scoring. Install it or disable aesthetic scoring.")
+    if _PIQ_METRIC is None or _PIQ_DEVICE != device:
+        _PIQ_METRIC = piq.CLIPIQA().to(device)
+        _PIQ_DEVICE = device
+    return _PIQ_METRIC
+
+
+def _frame_to_tensor(frame_bgr: np.ndarray) -> torch.Tensor:
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    tensor = torch.from_numpy(rgb).float() / 255.0
+    tensor = tensor.permute(2, 0, 1).unsqueeze(0)
+    return tensor
+
+
+def compute_nima_score(frame_bgr: np.ndarray) -> float:
+    device = _score_device()
+    metric = _ensure_nima_metric(device)
+    tensor = _frame_to_tensor(frame_bgr).to(device)
+    with torch.no_grad():
+        score = metric(tensor)
+        value = float(score.view(-1)[0].detach().cpu().item())
+    return value
+
+
+def compute_piq_score(frame_bgr: np.ndarray) -> float:
+    device = _score_device()
+    metric = _ensure_piq_metric(device)
+    tensor = _frame_to_tensor(frame_bgr).to(device)
+    with torch.no_grad():
+        score = metric(tensor)
+        value = float(score.view(-1)[0].detach().cpu().item())
+    return value
+
+
+def compute_overall_rating(clip_score: Optional[float], nima_score: Optional[float], piq_score: Optional[float]) -> Optional[float]:
+    if not all(isinstance(x, (int, float)) for x in (clip_score, nima_score, piq_score)):
+        return None
+    clip_val = float(clip_score)  # type: ignore[arg-type]
+    nima_val = float(nima_score)  # type: ignore[arg-type]
+    piq_val = float(piq_score)  # type: ignore[arg-type]
+    return (clip_val + nima_val) * piq_val
+
+
+def _format_score(value: Optional[float]) -> str:
+    return "NA" if not isinstance(value, (int, float)) else f"{value:.2f}"
+
+
+def passes_selection_thresholds(score_info: dict) -> bool:
+    clip_score = score_info.get("clip")
+    nima_score = score_info.get("nima")
+    piq_score = score_info.get("piq")
+    overall = score_info.get("overall")
+    if not isinstance(clip_score, (int, float)) or clip_score < CLIP_SELECTION_THRESHOLD:
+        return False
+    if not isinstance(nima_score, (int, float)) or nima_score < NIMA_SELECTION_THRESHOLD:
+        return False
+    if not isinstance(piq_score, (int, float)) or piq_score < PIQ_SELECTION_THRESHOLD:
+        return False
+    if not isinstance(overall, (int, float)) or overall < OVERALL_RATING_THRESHOLD:
+        return False
+    return True
 
 
 # ============================================================
@@ -956,6 +1065,9 @@ def init_db(conn: duckdb.DuckDBPyConnection) -> None:
             frame_index     INTEGER,
             timestamp_sec   DOUBLE,
             aesthetic       DOUBLE,
+            nima_score      DOUBLE,
+            piq_score       DOUBLE,
+            overall_rating  DOUBLE,
             tech_score      DOUBLE,
             sharpness_var   DOUBLE,
             noise_sigma     DOUBLE,
@@ -990,6 +1102,9 @@ def init_db(conn: duckdb.DuckDBPyConnection) -> None:
         ("composition_score", "DOUBLE"),
         ("subject_x_norm", "DOUBLE"),
         ("subject_y_norm", "DOUBLE"),
+        ("nima_score", "DOUBLE"),
+        ("piq_score", "DOUBLE"),
+        ("overall_rating", "DOUBLE"),
     ]:
         try:
             conn.execute(f"ALTER TABLE frames ADD COLUMN {col} {dtype};")
@@ -1003,6 +1118,9 @@ def insert_frame_row(
     frame_index: int,
     timestamp_sec: float,
     aesthetic: float,
+    nima_score: Optional[float],
+    piq_score: Optional[float],
+    overall_rating: Optional[float],
     tech_score: float,
     sharpness_var: float,
     noise_sigma: float,
@@ -1026,20 +1144,24 @@ def insert_frame_row(
         """
         INSERT INTO frames (
             video_path, frame_index, timestamp_sec,
-            aesthetic, tech_score, sharpness_var, noise_sigma,
+            aesthetic, nima_score, piq_score, overall_rating,
+            tech_score, sharpness_var, noise_sigma,
             clip_pct_shadows, clip_pct_highlights, mean_luma,
             color_cast_score, num_faces, has_face,
             face_quality_score, main_face_rel_area, composition_score,
             subject_x_norm, subject_y_norm,
             embed_dim, embedding
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             video_path,
             frame_index,
             float(timestamp_sec),
             float(aesthetic),
+            float(nima_score) if nima_score is not None else None,
+            float(piq_score) if piq_score is not None else None,
+            float(overall_rating) if overall_rating is not None else None,
             float(tech_score),
             float(sharpness_var),
             float(noise_sigma),
@@ -1133,15 +1255,21 @@ def process_video(
     overlay_color_ratio: float = 0.4,
     use_aesthetic: bool = True,
     start_sec: float = 0.0,
-    resize_long_edge: int = 0,
     skip_to_final_stage: bool = False,
     prefer_smiles: bool = True,
+    summary_log_path: Optional[str] = None,
 ) -> None:
     overall_start = time.time()
     start_sec = max(0.0, float(start_sec))
     first_chunk = start_sec <= 1e-6
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video not found: {video_path}")
+    if use_aesthetic and (pyiqa is None or piq is None):
+        raise RuntimeError(
+            "pyiqa and piq are required for aesthetic scoring in v11. "
+            "Install them or run with --disable-aesthetic."
+        )
+    output_root = os.path.abspath(output_dir)
     video_db_key = canonical_video_key(video_path)
     video_key_aliases = video_path_aliases(video_path)
 
@@ -1155,27 +1283,27 @@ def process_video(
 
     # Prepare image output directory as <output>/<video_name>/
     video_name = os.path.splitext(os.path.basename(video_path))[0]
-    video_out_dir = os.path.join(output_dir, video_name)
+    video_out_dir = os.path.join(output_root, f"__work_{video_name}")
     if first_chunk and os.path.exists(video_out_dir):
         shutil.rmtree(video_out_dir)
     os.makedirs(video_out_dir, exist_ok=True)
 
     final_index_path = os.path.join(video_out_dir, "_final_embeddings.npy")
-    final_removed_dir = os.path.join(video_out_dir, "finally_removed")
     if first_chunk:
-        shutil.rmtree(final_removed_dir, ignore_errors=True)
         try:
             os.remove(final_index_path)
         except Exception:
             pass
-    os.makedirs(final_removed_dir, exist_ok=True)
 
     filtered_dir = os.path.join(video_out_dir, "filtered")
+    shutil.rmtree(filtered_dir, ignore_errors=True)
     os.makedirs(filtered_dir, exist_ok=True)
-
+    rejected_root = os.path.join(output_root, "rejected")
+    os.makedirs(rejected_root, exist_ok=True)
     tmp_candidate_dir = os.path.join(
         video_out_dir, f"_candidates_tmp_{int(round(start_sec * 1000.0))}"
     )
+    shutil.rmtree(tmp_candidate_dir, ignore_errors=True)
     os.makedirs(tmp_candidate_dir, exist_ok=True)
 
     if first_chunk:
@@ -1184,7 +1312,7 @@ def process_video(
     max_seconds = float(max_seconds) if max_seconds is not None else None
 
     candidates: List[
-        Tuple[int, float, float, np.ndarray, Optional[str], Optional[np.ndarray], dict, dict, dict]
+        Tuple[int, float, float, np.ndarray, Optional[str], Optional[np.ndarray], dict, dict, dict, dict]
     ] = []
 
     total_frames = 1
@@ -1221,7 +1349,86 @@ def process_video(
         total_frames = max(1, est_frame_cap)
         progress_log_interval = max(1, total_frames // 100)
 
-    def save_filtered_frame(frame_img: np.ndarray, reason: str, details: Optional[dict] = None) -> None:
+    def record_summary(status: str, frame_idx: int, ts: float, score_info: Optional[dict], path: Optional[str], reason: Optional[str] = None) -> None:
+        if not summary_log_path:
+            return
+        clip_fmt = _format_score(score_info["clip"]) if score_info and "clip" in score_info else "NA"
+        nima_fmt = _format_score(score_info["nima"]) if score_info and "nima" in score_info else "NA"
+        piq_fmt = _format_score(score_info["piq"]) if score_info and "piq" in score_info else "NA"
+        overall_fmt = _format_score(score_info["overall"]) if score_info and "overall" in score_info else "NA"
+        rel_path = os.path.relpath(path, output_root) if path else "NA"
+        line = (
+            f"{video_name}\tstatus={status}\tframe={frame_idx}\tts={ts:.2f}\t"
+            f"clip={clip_fmt}\tnima={nima_fmt}\tpiq={piq_fmt}\toverall={overall_fmt}\tfile={rel_path}"
+        )
+        if reason:
+            line += f"\treason={reason}"
+        line += "\n"
+        try:
+            with open(summary_log_path, "a", encoding="utf-8") as log_f:
+                log_f.write(line)
+        except Exception:
+            pass
+
+    def _build_filename(prefix: str, idx: int, ts: float, score_info: dict, suffix: int | None = None) -> str:
+        clip_fmt = _format_score(score_info.get("clip"))
+        nima_fmt = _format_score(score_info.get("nima"))
+        piq_fmt = _format_score(score_info.get("piq"))
+        overall_fmt = _format_score(score_info.get("overall"))
+        extra = f"_{suffix}" if suffix is not None else ""
+        return (
+            f"{prefix}{idx}{extra}_t{ts:.2f}_"
+            f"clip-value-{clip_fmt}_nima-value-{nima_fmt}_"
+            f"piq-value-{piq_fmt}_overall-rating-{overall_fmt}.jpg"
+        )
+
+    def persist_rejected_candidate(candidate, reason: str) -> None:
+        frame_idx, ts, aest, _emb, tmp_path, stored_image, _tech, _face, _comp, score_info = candidate
+        name_idx = frame_idx
+        dest_name = _build_filename(f"reject_{reason}_", name_idx, ts, score_info)
+        dest_path = os.path.join(rejected_root, dest_name)
+        suffix = 1
+        while os.path.exists(dest_path):
+            dest_name = _build_filename(f"reject_{reason}_", name_idx, ts, score_info, suffix)
+            dest_path = os.path.join(rejected_root, dest_name)
+            suffix += 1
+        moved = False
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.replace(tmp_path, dest_path)
+                moved = True
+            except Exception:
+                moved = False
+        if stored_image is not None:
+            try:
+                cv2.imwrite(dest_path if not moved else dest_path, stored_image, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            except Exception:
+                pass
+        record_summary("rejected", name_idx, ts, score_info, dest_path, reason=reason)
+
+    def persist_rejected_raw(frame_idx: int, ts: float, frame_img: np.ndarray, reason: str, score_info: Optional[dict] = None) -> None:
+        info = score_info or {"clip": None, "nima": None, "piq": None, "overall": None}
+        dest_name = _build_filename(f"reject_{reason}_", frame_idx, ts, info)
+        dest_path = os.path.join(rejected_root, dest_name)
+        suffix = 1
+        while os.path.exists(dest_path):
+            dest_name = _build_filename(f"reject_{reason}_", frame_idx, ts, info, suffix)
+            dest_path = os.path.join(rejected_root, dest_name)
+            suffix += 1
+        try:
+            cv2.imwrite(dest_path, frame_img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+        except Exception:
+            pass
+        record_summary("rejected", frame_idx, ts, info, dest_path, reason=reason)
+
+    def save_filtered_frame(
+        frame_idx: int,
+        ts: float,
+        frame_img: np.ndarray,
+        reason: str,
+        details: Optional[dict] = None,
+        score_info: Optional[dict] = None,
+    ) -> None:
         slug = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in reason.lower())
         detail_suffix = ""
         if details:
@@ -1240,6 +1447,7 @@ def process_video(
             cv2.imwrite(image_path, frame_img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
         except Exception:
             image_path = ""
+        persist_rejected_raw(frame_idx, ts, frame_img, reason, score_info)
 
     stride_sec = max(frame_stride_sec, 1e-6)
 
@@ -1323,32 +1531,15 @@ def process_video(
     ) -> Optional[tuple]:
         original_frame = frame_bgr
         proc_frame = frame_bgr
-        quality_scale = 1.0
-        if resize_long_edge > 0:
-            h0, w0 = original_frame.shape[:2]
-            long_edge_src = max(h0, w0)
-            if long_edge_src > resize_long_edge:
-                scale = float(resize_long_edge) / float(long_edge_src)
-                new_w = max(1, int(round(w0 * scale)))
-                new_h = max(1, int(round(h0 * scale)))
-                try:
-                    proc_frame = cv2.resize(original_frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                except Exception:
-                    proc_frame = original_frame
-                quality_scale = scale
-            else:
-                quality_scale = 1.0
         skin_prob = frame_skin_prob if frame_skin_prob is not None else skin_probability(proc_frame)
         tech = compute_technical_quality(proc_frame)
         long_edge = max(tech["resolution_w"], tech["resolution_h"])
-        min_res_edge = MIN_RES_LONG_EDGE * quality_scale
-        min_total_pixels = MIN_TOTAL_PIXELS * (quality_scale ** 2)
-        min_res_edge = max(1.0, min_res_edge)
-        min_total_pixels = max(10.0, min_total_pixels)
-        if long_edge < min_res_edge or tech["total_pixels"] < min_total_pixels:
+        if long_edge < MIN_RES_LONG_EDGE or tech["total_pixels"] < MIN_TOTAL_PIXELS:
+            persist_rejected_raw(frame_idx, ts, original_frame, "low_resolution")
             return None
 
         if tech["tech_score"] < min_tech_score:
+            persist_rejected_raw(frame_idx, ts, original_frame, "low_tech_score")
             return None
 
         if is_black_slate(
@@ -1357,6 +1548,7 @@ def process_video(
             black_frame_threshold,
             black_frame_ratio,
         ):
+            persist_rejected_raw(frame_idx, ts, original_frame, "black_frame")
             return None
 
         run_face = should_run_face(proc_frame, skin_prob)
@@ -1419,14 +1611,18 @@ def process_video(
                     if people_ratio > faceless_people_ratio:
                         scenic_ok = False
                 if not scenic_ok:
+                    persist_rejected_raw(frame_idx, ts, original_frame, "faceless_not_scenic")
                     return None
         elif not face_has_detection and require_face:
+            persist_rejected_raw(frame_idx, ts, original_frame, "no_face")
             return None
 
         if face.get("has_face", False):
             face_sharpness = face.get("face_sharpness_var", 0.0)
             if face_sharpness < face_sharpness_threshold:
                 save_filtered_frame(
+                    frame_idx,
+                    ts,
                     original_frame,
                     "face_too_blurry",
                     {
@@ -1438,6 +1634,8 @@ def process_video(
             tilt = abs(float(face.get("face_tilt_deg", 0.0)))
             if tilt > max_face_tilt:
                 save_filtered_frame(
+                    frame_idx,
+                    ts,
                     original_frame,
                     "face_tilted",
                     {
@@ -1449,6 +1647,8 @@ def process_video(
             face_area = max(0.0, float(face.get("main_face_rel_area", 0.0)))
             if face_area < max(0.0, float(min_face_area_ratio)):
                 save_filtered_frame(
+                    frame_idx,
+                    ts,
                     original_frame,
                     "face_too_small",
                     {
@@ -1466,6 +1666,8 @@ def process_video(
                 center_y = 0.5
             if center_y < min_face_y_center:
                 save_filtered_frame(
+                    frame_idx,
+                    ts,
                     original_frame,
                     "face_too_low",
                     {
@@ -1478,6 +1680,7 @@ def process_video(
         if face.get("has_face", False):
             face_sharpness = face.get("face_sharpness_var", 0.0)
             if face_sharpness < face_sharpness_threshold:
+                persist_rejected_raw(frame_idx, ts, original_frame, "face_too_blurry")
                 return None
 
         has_smile = False
@@ -1502,24 +1705,42 @@ def process_video(
             hue_dominance=overlay_hue_dominance,
             color_ratio_threshold=overlay_color_ratio,
         ):
+            persist_rejected_raw(frame_idx, ts, original_frame, "overlay_card")
             return None
 
         if tech["sharpness_var"] < MIN_SHARPNESS_VAR and run_face:
             face_sharpness = face.get("face_sharpness_var", 0.0)
             if not (face.get("has_face", False) and face_sharpness >= (0.5 * MIN_SHARPNESS_VAR)):
+                persist_rejected_raw(frame_idx, ts, original_frame, "global_blur")
                 return None
 
         comp = compute_composition_features(proc_frame, face_info=face)
+        nima_score: Optional[float] = None
+        piq_score: Optional[float] = None
+        overall_rating: Optional[float] = None
         if use_aesthetic:
             aest = compute_aesthetic_score(proc_frame)
             threshold = faceless_min_aesthetic if faceless_candidate else float(min_aesthetic)
             if aest < float(threshold):
                 return None
+            nima_score = compute_nima_score(proc_frame)
+            piq_score = compute_piq_score(proc_frame)
+            overall_rating = compute_overall_rating(aest, nima_score, piq_score)
         else:
             aest = 0.0
             if faceless_candidate:
+                persist_rejected_raw(frame_idx, ts, original_frame, "faceless_without_aesthetic")
                 return None
         emb = compute_embedding(proc_frame)
+        score_info = {
+            "clip": float(aest),
+            "nima": nima_score,
+            "piq": piq_score,
+            "overall": overall_rating,
+        }
+        if use_aesthetic and not passes_selection_thresholds(score_info):
+            persist_rejected_raw(frame_idx, ts, original_frame, "score", score_info)
+            return None
 
         tmp_fname = f"{frame_idx:09d}_t{ts:.2f}.jpg"
         tmp_path = os.path.join(tmp_candidate_dir, tmp_fname)
@@ -1533,7 +1754,7 @@ def process_video(
         if not tmp_path:
             stored_image = original_frame.copy()
 
-        return (frame_idx, ts, float(aest), emb, tmp_path, stored_image, tech, face, comp)
+        return (frame_idx, ts, float(aest), emb, tmp_path, stored_image, tech, face, comp, score_info)
 
     workers = max(1, max_workers)
     executor = ThreadPoolExecutor(max_workers=workers) if workers > 1 and not skip_to_final_stage else None
@@ -1629,18 +1850,26 @@ def process_video(
     candidates.sort(key=lambda x: x[2], reverse=True)
 
     kept: List[
-        Tuple[int, float, float, np.ndarray, Optional[str], Optional[np.ndarray], dict, dict, dict]
+        Tuple[int, float, float, np.ndarray, Optional[str], Optional[np.ndarray], dict, dict, dict, dict]
     ] = []
     kept_embs: List[np.ndarray] = []
     effective_threshold = max(0.0, float(dedup_threshold))
     # Vectorized store of kept embeddings for fast similarity checks
     kept_mat: Optional[np.ndarray] = None
 
+    def _quality_score(aesthetic_value: float, score_info: Optional[dict]) -> float:
+        if score_info and isinstance(score_info.get("overall"), (int, float)):
+            try:
+                return float(score_info["overall"])
+            except Exception:
+                pass
+        return float(aesthetic_value)
+
     dedup_stage_start = time.time()
     total_candidates = max(1, len(candidates))
     dedup_log_every = max(1, total_candidates // 100)
     for idx, cand in enumerate(candidates, start=1):
-        frame_idx, ts, aest, emb, tmp_path, stored_image, tech, face, comp = cand
+        frame_idx, ts, aest, emb, tmp_path, stored_image, tech, face, comp, score_info = cand
         # If dedup disabled or nothing kept yet, accept immediately
         if effective_threshold <= 0.0 or kept_mat is None or kept_mat.size == 0:
             kept.append(cand)
@@ -1668,20 +1897,27 @@ def process_video(
                 max_sim = -1.0
                 best_idx = -1
         min_dist = 1.0 - max_sim
-        if min_dist < effective_threshold:
+        if min_dist < effective_threshold and best_idx >= 0:
+            existing_entry = kept[best_idx]
+            existing_face = existing_entry[7]
+            existing_smile = bool(existing_face.get("has_smile"))
+            candidate_smile = bool(face.get("has_smile"))
             replace_existing = False
-            if prefer_smiles and best_idx >= 0:
-                existing_entry = kept[best_idx]
-                existing_face = existing_entry[7]
-                existing_smile = bool(existing_face.get("has_smile"))
-                candidate_smile = bool(face.get("has_smile"))
-                if candidate_smile and not existing_smile:
-                    replace_existing = True
-                elif candidate_smile == existing_smile and float(aest) > float(existing_entry[2]):
-                    replace_existing = True
+            candidate_quality = _quality_score(aest, score_info)
+            existing_quality = _quality_score(existing_entry[2], existing_entry[9])
+            if prefer_smiles and candidate_smile and not existing_smile:
+                replace_existing = True
+            elif prefer_smiles and existing_smile and not candidate_smile:
+                replace_existing = False
+            elif candidate_quality > existing_quality:
+                replace_existing = True
+
             if replace_existing and best_idx >= 0:
+                persist_rejected_candidate(kept[best_idx], "replaced")
                 kept[best_idx] = cand
                 kept_mat[best_idx] = emb
+            else:
+                persist_rejected_candidate(cand, "dedup")
             continue
 
         kept.append(cand)
@@ -1702,7 +1938,7 @@ def process_video(
                 pass
 
     final_removed: List[
-        Tuple[int, float, float, np.ndarray, Optional[str], Optional[np.ndarray], dict, dict, dict]
+        Tuple[int, float, float, np.ndarray, Optional[str], Optional[np.ndarray], dict, dict, dict, dict]
     ] = []
     new_final_embeddings: List[np.ndarray] = []
     resolved_final_threshold = final_dedup_threshold if final_dedup_threshold is not None else dedup_threshold
@@ -1716,11 +1952,11 @@ def process_video(
 
     if resolved_final_threshold > 0.0 and kept:
         final_kept_list: List[
-            Tuple[int, float, float, np.ndarray, Optional[str], Optional[np.ndarray], dict, dict, dict]
+            Tuple[int, float, float, np.ndarray, Optional[str], Optional[np.ndarray], dict, dict, dict, dict]
         ] = []
         chunk_final_mat: Optional[np.ndarray] = None
         for cand in kept:
-            emb = cand[3]
+            frame_idx, ts, aest, emb, tmp_path, stored_image, tech, face, comp, score_info = cand
             duplicate = False
             if global_final_mat is not None and global_final_mat.size > 0:
                 try:
@@ -1742,16 +1978,19 @@ def process_video(
                     if sims_chunk.size:
                         chunk_best_idx = int(np.argmax(sims_chunk))
                         chunk_dist = 1.0 - float(sims_chunk[chunk_best_idx])
-                        if chunk_dist < resolved_final_threshold:
-                            if prefer_smiles and chunk_best_idx >= 0:
-                                existing_entry = final_kept_list[chunk_best_idx]
-                                existing_face = existing_entry[7]
-                                existing_smile = bool(existing_face.get("has_smile"))
-                                candidate_smile = bool(face.get("has_smile"))
-                                if candidate_smile and not existing_smile:
-                                    replaced_chunk_entry = True
-                                elif candidate_smile == existing_smile and float(aest) > float(existing_entry[2]):
-                                    replaced_chunk_entry = True
+                        if chunk_dist < resolved_final_threshold and chunk_best_idx >= 0:
+                            existing_entry = final_kept_list[chunk_best_idx]
+                            existing_face = existing_entry[7]
+                            existing_smile = bool(existing_face.get("has_smile"))
+                            candidate_smile = bool(face.get("has_smile"))
+                            existing_quality = _quality_score(existing_entry[2], existing_entry[9])
+                            candidate_quality = _quality_score(aest, score_info)
+                            if prefer_smiles and candidate_smile and not existing_smile:
+                                replaced_chunk_entry = True
+                            elif prefer_smiles and existing_smile and not candidate_smile:
+                                replaced_chunk_entry = False
+                            elif candidate_quality > existing_quality:
+                                replaced_chunk_entry = True
                             if not replaced_chunk_entry:
                                 final_removed.append(cand)
                                 continue
@@ -1787,13 +2026,19 @@ def process_video(
         pass
 
     write_stage_start = time.time()
-    for rank, (frame_idx, ts, aest, emb, tmp_path, stored_image, tech, face, comp) in enumerate(kept, start=1):
+    for rank, (frame_idx, ts, aest, emb, tmp_path, stored_image, tech, face, comp, score_info) in enumerate(kept, start=1):
+        nima_score = score_info.get("nima")
+        piq_score = score_info.get("piq")
+        overall_rating = score_info.get("overall")
         insert_frame_row(
             conn=conn,
             video_path=video_db_key,
             frame_index=frame_idx,
             timestamp_sec=ts,
             aesthetic=aest,
+            nima_score=nima_score,
+            piq_score=piq_score,
+            overall_rating=overall_rating,
             tech_score=tech["tech_score"],
             sharpness_var=tech["sharpness_var"],
             noise_sigma=tech["noise_sigma"],
@@ -1811,9 +2056,30 @@ def process_video(
             embedding=emb,
         )
 
-        # Move tmp JPEG into final location when available, avoiding re-encode
-        fname = f"{frame_idx:09d}_t{ts:.2f}_aest{aest:.2f}.jpg"
-        dest_path = os.path.join(video_out_dir, fname)
+        clip_fmt = _format_score(score_info.get("clip"))
+        nima_fmt = _format_score(nima_score)
+        piq_fmt = _format_score(piq_score)
+        overall_fmt = _format_score(overall_rating)
+        base_name = (
+            f"out{rank}_t{ts:.2f}_"
+            f"clip-value-{clip_fmt}_"
+            f"nima-value-{nima_fmt}_"
+            f"piq-value-{piq_fmt}_"
+            f"overall-rating-{overall_fmt}.jpg"
+        )
+        dest_name = base_name
+        dest_path = os.path.join(output_root, dest_name)
+        suffix = 1
+        while os.path.exists(dest_path):
+            dest_name = (
+                f"out{rank}_{suffix}_t{ts:.2f}_"
+                f"clip-value-{clip_fmt}_"
+                f"nima-value-{nima_fmt}_"
+                f"piq-value-{piq_fmt}_"
+                f"overall-rating-{overall_fmt}.jpg"
+            )
+            dest_path = os.path.join(output_root, dest_name)
+            suffix += 1
         moved = False
         if tmp_path and os.path.exists(tmp_path):
             try:
@@ -1834,6 +2100,7 @@ def process_video(
                         cv2.imwrite(dest_path, img, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
                 except Exception:
                     pass
+        record_summary("selected", frame_idx, ts, score_info, dest_path)
 
         if progress_only and (rank == 1 or rank == total_kept or rank % progress_step == 0):
             pct = (rank / max(1, total_kept)) * 100.0
@@ -1854,30 +2121,9 @@ def process_video(
     except Exception:
         pass
 
-    # Move duplicates discarded in final stage
+    # Clean up temporary files for duplicates discarded in final stage
     for dup in final_removed:
-        frame_idx, ts, aest, emb, tmp_path, stored_image, tech, face, comp = dup
-        dup_name = f"{frame_idx:09d}_t{ts:.2f}_dup.jpg"
-        dest_path = os.path.join(final_removed_dir, dup_name)
-        moved = False
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.replace(tmp_path, dest_path)
-                moved = True
-            except Exception:
-                moved = False
-        if not moved:
-            src_img = stored_image
-            if src_img is None and tmp_path and os.path.exists(tmp_path):
-                try:
-                    src_img = cv2.imread(tmp_path)
-                except Exception:
-                    src_img = None
-            if src_img is not None:
-                try:
-                    cv2.imwrite(dest_path, src_img, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-                except Exception:
-                    pass
+        persist_rejected_candidate(dup, "final_dedup")
 
     if progress_only:
         try:
@@ -1921,34 +2167,6 @@ def collect_video_inputs(input_path: str) -> List[str]:
         collected.sort()
         return collected
     raise FileNotFoundError(f"Input path not found: {input_path}")
-
-
-def move_selected_frames_to_output(video_out_dir: str, output_root: str, video_name: str) -> None:
-    if not os.path.isdir(video_out_dir):
-        return
-    try:
-        entries = os.listdir(video_out_dir)
-    except Exception:
-        return
-    for fname in entries:
-        if fname.startswith("_"):
-            continue
-        src_path = os.path.join(video_out_dir, fname)
-        if not os.path.isfile(src_path):
-            continue
-        if not fname.lower().endswith(".jpg"):
-            continue
-        dest_name = f"{video_name}__{fname}"
-        dest_path = os.path.join(output_root, dest_name)
-        suffix = 1
-        while os.path.exists(dest_path):
-            dest_name = f"{video_name}__{suffix}_{fname}"
-            dest_path = os.path.join(output_root, dest_name)
-            suffix += 1
-        try:
-            os.replace(src_path, dest_path)
-        except Exception:
-            pass
 
 
 def parse_args() -> argparse.Namespace:
@@ -2158,12 +2376,6 @@ def parse_args() -> argparse.Namespace:
         help="Minimum ratio of vivid blue/yellow pixels to treat as an overlay card (default: 0.4)",
     )
     parser.add_argument(
-        "--resize-long-edge",
-        type=int,
-        default=0,
-        help="If >0, resize frames so their longest edge equals this value before processing",
-    )
-    parser.add_argument(
         "--skip-to-final-stage",
         action="store_true",
         help="Skip new frame processing and only run final deduplication/output steps",
@@ -2192,12 +2404,24 @@ if __name__ == "__main__":
     total_videos = len(video_inputs)
     chunk_duration = float(getattr(args, "chunk_duration_secs", 300.0))
 
+    output_root = os.path.abspath(args.output)
+    args.output = output_root
+    if os.path.exists(output_root):
+        shutil.rmtree(output_root)
+    os.makedirs(output_root, exist_ok=True)
+    summary_log = os.path.join(output_root, "extraction_summary.txt")
+    with open(summary_log, "w", encoding="utf-8") as log_f:
+        log_f.write("video\tstatus\tframe\tts\tclip\tnima\tpiq\toverall\tfile\treason\n")
+
     for idx, video_path in enumerate(video_inputs, start=1):
-        if args.progress_only and total_videos > 1:
-            try:
-                print(f"[prog] video {idx}/{total_videos}: {video_path}")
-            except Exception:
-                pass
+        video_msg = f"video {idx}/{total_videos}: {video_path}"
+        try:
+            if args.progress_only:
+                print(f"[prog] {video_msg}")
+            else:
+                print(f"[info] {video_msg}")
+        except Exception:
+            pass
 
         duration_sec = get_video_duration(video_path)
         max_seconds = getattr(args, "max_seconds", None)
@@ -2269,12 +2493,11 @@ if __name__ == "__main__":
                 overlay_color_ratio=getattr(args, "overlay_color_ratio", 0.4),
                 use_aesthetic=not getattr(args, "disable_aesthetic", False),
                 start_sec=chunk_start,
-                resize_long_edge=getattr(args, "resize_long_edge", 0),
                 skip_to_final_stage=getattr(args, "skip_to_final_stage", False),
                 prefer_smiles=not getattr(args, "no_prefer_smiles", False),
+                summary_log_path=summary_log,
             )
 
-        if total_videos > 1:
-            video_name = os.path.splitext(os.path.basename(video_path))[0]
-            video_out_dir = os.path.join(args.output, video_name)
-            move_selected_frames_to_output(video_out_dir, args.output, video_name)
+        video_name = os.path.splitext(os.path.basename(video_path))[0]
+        work_dir = os.path.join(output_root, f"__work_{video_name}")
+        shutil.rmtree(work_dir, ignore_errors=True)

@@ -1,0 +1,8 @@
+torch>=2.0.0
+torchvision>=0.15.0
+clip-anytorch>=2.5.0
+pyiqa>=0.1.14.1
+piq>=0.8.0
+brisque>=0.0.15
+Pillow>=9.0.0
+opencv-python-headless>=4.10.0
